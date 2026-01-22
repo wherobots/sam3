@@ -644,9 +644,9 @@ class SequenceGeometryEncoder(nn.Module):
             # boxes are [Num_boxes, bs, 4], normalized in [0, 1]
             # We need to denormalize, and convert to [x, y, x, y]
             boxes_xyxy = box_cxcywh_to_xyxy(boxes)
-            scale = torch.tensor([W, H, W, H], dtype=boxes_xyxy.dtype)
-            scale = scale.pin_memory().to(device=boxes_xyxy.device, non_blocking=True)
-            scale = scale.view(1, 1, 4)
+            scale = torch.tensor(
+                [W, H, W, H], dtype=boxes_xyxy.dtype, device=boxes_xyxy.device
+            ).view(1, 1, 4)
             boxes_xyxy = boxes_xyxy * scale
             sampled = torchvision.ops.roi_align(
                 img_feats, boxes_xyxy.float().transpose(0, 1).unbind(0), self.roi_size
