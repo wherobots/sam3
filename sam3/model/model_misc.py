@@ -36,6 +36,244 @@ class MultiheadAttentionWrapper(nn.MultiheadAttention):
         return super().forward(*args, **kwargs)
 
 
+class ExportFriendlyMultiheadAttention(nn.Module):
+    """MultiheadAttention using F.scaled_dot_product_attention for torch.export compatibility.
+
+    The standard nn.MultiheadAttention uses F.multi_head_attention_forward which has
+    internal guards on sequence length that fail with dynamic shapes in torch.export.
+    This implementation uses F.scaled_dot_product_attention directly to avoid those guards.
+
+    Why this is needed:
+    -------------------
+    When exporting with dynamic shapes (e.g., variable image H/W), PyTorch's
+    F.multi_head_attention_forward creates guards like `Eq(seq_len, 5184)` which
+    fail during torch.export because the sequence length is symbolic.
+
+    The guard happens in shape validation code (checking attn_mask dimensions)
+    BEFORE scaled_dot_product_attention is even called, so using
+    `sdpa_kernel([SDPBackend.MATH])` alone doesn't help.
+
+    This class bypasses F.multi_head_attention_forward entirely by:
+    1. Manually projecting Q, K, V
+    2. Calling F.scaled_dot_product_attention directly
+    3. Avoiding all shape validation guards
+
+    Related PyTorch issues:
+    - https://github.com/pytorch/pytorch/issues/170127
+    - https://github.com/pytorch/pytorch/issues/124502
+    """
+
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        bias: bool = True,
+        batch_first: bool = False,
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.batch_first = batch_first
+        self.dropout = dropout
+
+        assert self.head_dim * num_heads == embed_dim, "embed_dim must be divisible by num_heads"
+
+        # Combined QKV projection for efficiency
+        self.in_proj_weight = nn.Parameter(torch.empty(3 * embed_dim, embed_dim))
+        if bias:
+            self.in_proj_bias = nn.Parameter(torch.empty(3 * embed_dim))
+        else:
+            self.register_parameter("in_proj_bias", None)
+
+        # Output projection
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        nn.init.xavier_uniform_(self.in_proj_weight)
+        if self.in_proj_bias is not None:
+            nn.init.zeros_(self.in_proj_bias)
+        nn.init.xavier_uniform_(self.out_proj.weight)
+        if self.out_proj.bias is not None:
+            nn.init.zeros_(self.out_proj.bias)
+
+    @classmethod
+    def from_nn_mha(cls, mha: nn.MultiheadAttention) -> "ExportFriendlyMultiheadAttention":
+        """Create an ExportFriendlyMultiheadAttention from an nn.MultiheadAttention.
+
+        Copies all weights from the source module.
+
+        Args:
+            mha: Source nn.MultiheadAttention module
+
+        Returns:
+            New ExportFriendlyMultiheadAttention with copied weights
+        """
+        # Create new instance with same configuration
+        new_mha = cls(
+            embed_dim=mha.embed_dim,
+            num_heads=mha.num_heads,
+            dropout=mha.dropout,
+            bias=mha.in_proj_bias is not None,
+            batch_first=mha.batch_first,
+        )
+
+        # Copy weights
+        with torch.no_grad():
+            new_mha.in_proj_weight.copy_(mha.in_proj_weight)
+            if mha.in_proj_bias is not None:
+                new_mha.in_proj_bias.copy_(mha.in_proj_bias)
+            new_mha.out_proj.weight.copy_(mha.out_proj.weight)
+            if mha.out_proj.bias is not None:
+                new_mha.out_proj.bias.copy_(mha.out_proj.bias)
+
+        return new_mha
+
+    def forward(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        key_padding_mask: Optional[Tensor] = None,
+        attn_mask: Optional[Tensor] = None,
+        need_weights: bool = False,
+    ) -> tuple[Tensor, None]:
+        """Forward pass using scaled dot product attention.
+
+        Args:
+            query: (L, N, E) or (N, L, E) if batch_first
+            key: (S, N, E) or (N, S, E) if batch_first
+            value: (S, N, E) or (N, S, E) if batch_first
+            key_padding_mask: (N, S) where True means ignore
+            attn_mask: (L, S) or (N*num_heads, L, S)
+            need_weights: Ignored, always returns None for weights
+
+        Returns:
+            attn_output: (L, N, E) or (N, L, E) if batch_first
+            attn_weights: Always None (for compatibility)
+        """
+        # Convert to batch_first format for SDPA
+        if not self.batch_first:
+            query = query.transpose(0, 1)  # (N, L, E)
+            key = key.transpose(0, 1)  # (N, S, E)
+            value = value.transpose(0, 1)  # (N, S, E)
+
+        batch_size, tgt_len, _ = query.shape
+        src_len = key.shape[1]
+
+        # Project Q, K, V using combined weight
+        # For cross-attention, we project Q from query and K,V from key/value
+        q = F.linear(
+            query,
+            self.in_proj_weight[: self.embed_dim],
+            self.in_proj_bias[: self.embed_dim] if self.in_proj_bias is not None else None,
+        )
+        k = F.linear(
+            key,
+            self.in_proj_weight[self.embed_dim : 2 * self.embed_dim],
+            self.in_proj_bias[self.embed_dim : 2 * self.embed_dim]
+            if self.in_proj_bias is not None
+            else None,
+        )
+        v = F.linear(
+            value,
+            self.in_proj_weight[2 * self.embed_dim :],
+            self.in_proj_bias[2 * self.embed_dim :] if self.in_proj_bias is not None else None,
+        )
+
+        # Reshape to (N, num_heads, L/S, head_dim)
+        q = q.view(batch_size, tgt_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch_size, src_len, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(batch_size, src_len, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # Handle attention mask
+        # SDPA expects: (N, num_heads, L, S) or (L, S) broadcastable
+        # Input attn_mask is (L, S) or (N*num_heads, L, S)
+        if attn_mask is not None:
+            if attn_mask.dim() == 2:
+                # (L, S) -> expand for SDPA
+                attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)  # (1, 1, L, S)
+            elif attn_mask.dim() == 3:
+                # (N*num_heads, L, S) -> (N, num_heads, L, S)
+                attn_mask = attn_mask.view(batch_size, self.num_heads, tgt_len, src_len)
+
+        # Handle key_padding_mask
+        # SDPA expects additive mask, True = -inf
+        if key_padding_mask is not None:
+            # (N, S) -> (N, 1, 1, S)
+            key_padding_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
+            # Convert bool mask to additive mask
+            key_padding_mask = key_padding_mask.to(dtype=q.dtype)
+            key_padding_mask = key_padding_mask.masked_fill(key_padding_mask.bool(), float("-inf"))
+
+            if attn_mask is not None:
+                attn_mask = attn_mask + key_padding_mask
+            else:
+                attn_mask = key_padding_mask
+
+        # Use scaled dot product attention
+        dropout_p = self.dropout if self.training else 0.0
+        attn_output = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_mask, dropout_p=dropout_p
+        )
+
+        # Reshape back: (N, num_heads, L, head_dim) -> (N, L, E)
+        attn_output = (
+            attn_output.transpose(1, 2).contiguous().view(batch_size, tgt_len, self.embed_dim)
+        )
+
+        # Output projection
+        attn_output = self.out_proj(attn_output)
+
+        # Convert back to seq_first if needed
+        if not self.batch_first:
+            attn_output = attn_output.transpose(0, 1)  # (L, N, E)
+
+        return attn_output, None
+
+
+def replace_mha_with_export_friendly(
+    module: nn.Module,
+    verbose: bool = False,
+) -> int:
+    """Replace all nn.MultiheadAttention modules with ExportFriendlyMultiheadAttention.
+
+    This enables torch.export with dynamic shapes by bypassing
+    F.multi_head_attention_forward which has guards on sequence length.
+
+    Recursively traverses the module tree and replaces:
+    - nn.MultiheadAttention
+    - MultiheadAttentionWrapper (subclass of nn.MultiheadAttention)
+
+    Args:
+        module: Root module to process (modified in-place)
+        verbose: If True, print each replacement
+
+    Returns:
+        Number of modules replaced
+    """
+    count = 0
+
+    for name, child in list(module.named_children()):
+        if isinstance(child, nn.MultiheadAttention):
+            # Replace with export-friendly version
+            new_child = ExportFriendlyMultiheadAttention.from_nn_mha(child)
+            setattr(module, name, new_child)
+            count += 1
+            if verbose:
+                print(
+                    f"Replaced {name}: {type(child).__name__} -> ExportFriendlyMultiheadAttention"
+                )
+        else:
+            # Recurse into children
+            count += replace_mha_with_export_friendly(child, verbose=verbose)
+
+    return count
+
+
 class DotProductScoring(torch.nn.Module):
     def __init__(
         self,
@@ -151,11 +389,7 @@ class TransformerWrapper(nn.Module):
     def _reset_parameters(self):
         for n, p in self.named_parameters():
             if p.dim() > 1:
-                if (
-                    "box_embed" not in n
-                    and "query_embed" not in n
-                    and "reference_points" not in n
-                ):
+                if "box_embed" not in n and "query_embed" not in n and "reference_points" not in n:
                     nn.init.xavier_uniform_(p)
 
 
@@ -249,26 +483,18 @@ def gen_sineembed_for_position(pos_tensor, num_feats=256):
     y_embed = pos_tensor[:, :, 1] * scale
     pos_x = x_embed[:, :, None] / dim_t
     pos_y = y_embed[:, :, None] / dim_t
-    pos_x = torch.stack(
-        (pos_x[:, :, 0::2].sin(), pos_x[:, :, 1::2].cos()), dim=3
-    ).flatten(2)
-    pos_y = torch.stack(
-        (pos_y[:, :, 0::2].sin(), pos_y[:, :, 1::2].cos()), dim=3
-    ).flatten(2)
+    pos_x = torch.stack((pos_x[:, :, 0::2].sin(), pos_x[:, :, 1::2].cos()), dim=3).flatten(2)
+    pos_y = torch.stack((pos_y[:, :, 0::2].sin(), pos_y[:, :, 1::2].cos()), dim=3).flatten(2)
     if pos_tensor.size(-1) == 2:
         pos = torch.cat((pos_y, pos_x), dim=2)
     elif pos_tensor.size(-1) == 4:
         w_embed = pos_tensor[:, :, 2] * scale
         pos_w = w_embed[:, :, None] / dim_t
-        pos_w = torch.stack(
-            (pos_w[:, :, 0::2].sin(), pos_w[:, :, 1::2].cos()), dim=3
-        ).flatten(2)
+        pos_w = torch.stack((pos_w[:, :, 0::2].sin(), pos_w[:, :, 1::2].cos()), dim=3).flatten(2)
 
         h_embed = pos_tensor[:, :, 3] * scale
         pos_h = h_embed[:, :, None] / dim_t
-        pos_h = torch.stack(
-            (pos_h[:, :, 0::2].sin(), pos_h[:, :, 1::2].cos()), dim=3
-        ).flatten(2)
+        pos_h = torch.stack((pos_h[:, :, 0::2].sin(), pos_h[:, :, 1::2].cos()), dim=3).flatten(2)
 
         pos = torch.cat((pos_y, pos_x, pos_w, pos_h), dim=2)
     else:
@@ -322,11 +548,9 @@ class SAM3Output(list):
         loss_stages: Optional[List[int]] = None,
     ):
         if output is not None:
-            assert (
-                isinstance(output, list)
-                and len(output) > 0
-                and isinstance(output[0], list)
-            ), "Expected output to be a list of lists"
+            assert isinstance(output, list) and len(output) > 0 and isinstance(output[0], list), (
+                "Expected output to be a list of lists"
+            )
             self.output = output
         else:
             self.output = []
@@ -379,9 +603,7 @@ class SAM3Output(list):
         This class is used internally by the SAM3Output.iteration_mode method.
         """
 
-        def __init__(
-            self, model_output: "SAM3Output", iter_mode: "SAM3Output.IterMode"
-        ):
+        def __init__(self, model_output: "SAM3Output", iter_mode: "SAM3Output.IterMode"):
             self._model_output = model_output
             self._orig_iter_mode = model_output.iter_mode
             self._new_iter_mode = iter_mode
@@ -397,9 +619,7 @@ class SAM3Output(list):
             return super().__exit__(exc_type, exc_value, traceback)
 
     @staticmethod
-    def iteration_mode(
-        model_output: "SAM3Output", iter_mode: IterMode
-    ) -> _IterationMode:
+    def iteration_mode(model_output: "SAM3Output", iter_mode: IterMode) -> _IterationMode:
         """
         Returns a context manager that allows you to temporarily change the iteration mode of the SAM3Output object.
         Args:
@@ -411,9 +631,7 @@ class SAM3Output(list):
         return SAM3Output._IterationMode(model_output=model_output, iter_mode=iter_mode)
 
     def append(self, item: list):
-        assert isinstance(item, list), (
-            f"Only list items are supported. Got {type(item)}"
-        )
+        assert isinstance(item, list), f"Only list items are supported. Got {type(item)}"
         self.output.append(item)
 
     def __repr__(self):
