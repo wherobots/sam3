@@ -95,20 +95,32 @@ def apply_rotary_enc(
 def window_partition(x: Tensor, window_size: int) -> Tuple[Tensor, Tuple[int, int]]:
     """
     Partition into non-overlapping windows with padding if needed.
+
     Args:
         x (tensor): input tokens with [B, H, W, C].
         window_size (int): window size.
+
     Returns:
         windows: windows after partition with [B * num_windows, window_size, window_size, C].
         (Hp, Wp): padded height and width before partition
+
+    Note:
+        This function always pads (even if pad is 0) to avoid data-dependent control flow,
+        which is required for torch.export with dynamic shapes.
     """
     B, H, W, C = x.shape
 
-    pad_h = (window_size - H % window_size) % window_size
-    pad_w = (window_size - W % window_size) % window_size
-    if pad_h > 0 or pad_w > 0:
-        x = F.pad(x, (0, 0, 0, pad_w, 0, pad_h))
-    Hp, Wp = H + pad_h, W + pad_w
+    # Compute padded size using ceiling division to next multiple of window_size
+    # Hp = ceil(H / window_size) * window_size
+    Hp = ((H + window_size - 1) // window_size) * window_size
+    Wp = ((W + window_size - 1) // window_size) * window_size
+
+    pad_h = Hp - H
+    pad_w = Wp - W
+
+    # Always pad (F.pad handles zero padding correctly)
+    # This avoids data-dependent branching for torch.export compatibility
+    x = F.pad(x, (0, 0, 0, pad_w, 0, pad_h))
 
     x = x.view(B, Hp // window_size, window_size, Wp // window_size, window_size, C)
     windows = x.permute(0, 1, 3, 2, 4, 5).reshape(-1, window_size, window_size, C)
@@ -120,24 +132,29 @@ def window_unpartition(
 ) -> Tensor:
     """
     Window unpartition into original sequences and removing padding.
+
     Args:
         x (tensor): input tokens with [B * num_windows, window_size, window_size, C].
         window_size (int): window size.
         pad_hw (Tuple): padded height and width (Hp, Wp).
         hw (Tuple): original height and width (H, W) before padding.
+
     Returns:
         x: unpartitioned sequences with [B, H, W, C].
+
+    Note:
+        This function always slices to (H, W) to avoid data-dependent control flow,
+        which is required for torch.export with dynamic shapes.
     """
     Hp, Wp = pad_hw
     H, W = hw
     B = windows.shape[0] // (Hp * Wp // window_size // window_size)
-    x = windows.reshape(
-        B, Hp // window_size, Wp // window_size, window_size, window_size, -1
-    )
+    x = windows.reshape(B, Hp // window_size, Wp // window_size, window_size, window_size, -1)
     x = x.permute(0, 1, 3, 2, 4, 5).reshape(B, Hp, Wp, -1)
 
-    if Hp > H or Wp > W:
-        x = x[:, :H, :W, :]
+    # Always slice to original size (slicing with same size is a no-op)
+    # This avoids data-dependent branching for torch.export compatibility
+    x = x[:, :H, :W, :]
     return x
 
 
@@ -291,9 +308,7 @@ def concat_rel_pos(
     eye_w = eye_w.view(1, 1, k_w, k_w).expand([B, k_h, k_w, k_w])
 
     q = torch.cat([r_q * scale_ratio, rel_h, rel_w], dim=-1).view(B, q_h * q_w, -1)
-    k = torch.cat([k.view(B, k_h, k_w, -1), eye_h, eye_w], dim=-1).view(
-        B, k_h * k_w, -1
-    )
+    k = torch.cat([k.view(B, k_h, k_w, -1), eye_h, eye_w], dim=-1).view(B, k_h * k_w, -1)
 
     return q, k
 
@@ -402,12 +417,8 @@ class Attention(nn.Module):
         assert self.input_size is not None
         assert self.cls_token is False, "not supported"
         # initialize relative positional embeddings
-        self.rel_pos_h = nn.Parameter(
-            torch.zeros(2 * self.input_size[0] - 1, self.head_dim)
-        )
-        self.rel_pos_w = nn.Parameter(
-            torch.zeros(2 * self.input_size[1] - 1, self.head_dim)
-        )
+        self.rel_pos_h = nn.Parameter(torch.zeros(2 * self.input_size[0] - 1, self.head_dim))
+        self.rel_pos_w = nn.Parameter(torch.zeros(2 * self.input_size[1] - 1, self.head_dim))
 
         if not rel_pos_zero_init:
             trunc_normal_(self.rel_pos_h, std=0.02)
@@ -504,11 +515,7 @@ class Attention(nn.Module):
         x = F.scaled_dot_product_attention(q, k, v)
 
         if ndim == 4:
-            x = (
-                x.view(B, self.num_heads, H, W, -1)
-                .permute(0, 2, 3, 1, 4)
-                .reshape(B, H, W, -1)
-            )
+            x = x.view(B, self.num_heads, H, W, -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
         else:
             x = x.view(B, self.num_heads, L, -1).permute(0, 2, 1, 3).reshape(B, L, -1)
 
@@ -578,9 +585,7 @@ class Block(nn.Module):
             rope_interp=rope_interp,
             cls_token=cls_token,
         )
-        self.ls1 = (
-            LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
-        )
+        self.ls1 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
         self.norm2 = norm_layer(dim)
@@ -590,9 +595,7 @@ class Block(nn.Module):
             act_layer=act_layer,
             drop=(dropout, 0.0),
         )
-        self.ls2 = (
-            LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
-        )
+        self.ls2 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
         self.dropout = nn.Dropout(dropout)
         self.window_size = window_size
 
@@ -708,9 +711,7 @@ class ViT(nn.Module):
         self.retain_cls_token = retain_cls_token
         if self.retain_cls_token:
             assert pretrain_use_cls_token
-            assert len(window_block_indexes) == 0, (
-                "windowing not supported with cls token"
-            )
+            assert len(window_block_indexes) == 0, "windowing not supported with cls token"
 
             assert sum(self.rel_pos_blocks) == 0, "rel pos not supported with cls token"
 
@@ -736,9 +737,7 @@ class ViT(nn.Module):
 
         if self.use_abs_pos:
             # Initialize absolute positional embedding with pretrain image size.
-            num_patches = (pretrain_img_size // patch_size) * (
-                pretrain_img_size // patch_size
-            )
+            num_patches = (pretrain_img_size // patch_size) * (pretrain_img_size // patch_size)
             num_positions = (num_patches + 1) if pretrain_use_cls_token else num_patches
             self.pos_embed = nn.Parameter(torch.zeros(1, num_positions, embed_dim))
         else:
@@ -783,9 +782,7 @@ class ViT(nn.Module):
 
         self.return_interm_layers = return_interm_layers
         self.channel_list = (
-            [embed_dim] * len(self.full_attn_ids)
-            if return_interm_layers
-            else [embed_dim]
+            [embed_dim] * len(self.full_attn_ids) if return_interm_layers else [embed_dim]
         )
 
         if self.pos_embed is not None:
@@ -797,9 +794,7 @@ class ViT(nn.Module):
         self.apply(self._init_weights)
 
         if compile_mode is not None:
-            self.forward = torch.compile(
-                self.forward, mode=compile_mode, fullgraph=True
-            )
+            self.forward = torch.compile(self.forward, mode=compile_mode, fullgraph=True)
             if self.use_act_checkpoint and self.training:
                 torch._dynamo.config.optimize_ddp = False
 
@@ -852,9 +847,7 @@ class ViT(nn.Module):
                 else:
                     assert feats.ndim == 3
                     h = w = math.sqrt(feats.shape[1])
-                    feats = feats.reshape(
-                        feats.shape[0], h, w, feats.shape[-1]
-                    ).permute(0, 3, 1, 2)
+                    feats = feats.reshape(feats.shape[0], h, w, feats.shape[-1]).permute(0, 3, 1, 2)
 
                 outputs.append(feats)
 
