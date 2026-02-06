@@ -522,6 +522,41 @@ class TransformerEncoderFusion(TransformerEncoder):
         prompt_pos: Optional[Tensor] = None,
         feat_sizes: Optional[List[int]] = None,
         encoder_extra_kwargs: Optional[Dict] = None,
+        prompt_group_size: Optional[int] = None,
+    ):
+        if prompt_group_size is not None and prompt_group_size > 1:
+            return self._forward_grouped_prompts(
+                src=src,
+                prompt=prompt,
+                src_key_padding_mask=src_key_padding_mask,
+                src_pos=src_pos,
+                prompt_key_padding_mask=prompt_key_padding_mask,
+                prompt_pos=prompt_pos,
+                feat_sizes=feat_sizes,
+                encoder_extra_kwargs=encoder_extra_kwargs,
+                prompt_group_size=prompt_group_size,
+            )
+        return self._forward_single_prompt(
+            src=src,
+            prompt=prompt,
+            src_key_padding_mask=src_key_padding_mask,
+            src_pos=src_pos,
+            prompt_key_padding_mask=prompt_key_padding_mask,
+            prompt_pos=prompt_pos,
+            feat_sizes=feat_sizes,
+            encoder_extra_kwargs=encoder_extra_kwargs,
+        )
+
+    def _forward_single_prompt(
+        self,
+        src: List[Tensor],
+        prompt: Tensor,
+        src_key_padding_mask: Optional[List[Tensor]] = None,
+        src_pos: Optional[List[Tensor]] = None,
+        prompt_key_padding_mask: Optional[Tensor] = None,
+        prompt_pos: Optional[Tensor] = None,
+        feat_sizes: Optional[List[int]] = None,
+        encoder_extra_kwargs: Optional[Dict] = None,
     ):
         # Restore spatial shapes of vision
         bs = src[0].shape[1]  # seq first
@@ -550,7 +585,7 @@ class TransformerEncoderFusion(TransformerEncoder):
             pooled_text = self.text_pooling_proj(pooled_text)[
                 ..., None, None
             ]  # prompt is seq first
-            src = [x.add_(pooled_text) for x in src]
+            src = [x + pooled_text for x in src]
 
         (
             out,
@@ -573,6 +608,80 @@ class TransformerEncoderFusion(TransformerEncoder):
             "padding_mask": key_padding_masks_flatten,
             "pos_embed": lvl_pos_embed_flatten,
             "memory_text": prompt,
+            "level_start_index": level_start_index,
+            "spatial_shapes": spatial_shapes,
+            "valid_ratios": valid_ratios,
+        }
+
+    def _forward_grouped_prompts(
+        self,
+        src: List[Tensor],
+        prompt: Tensor,
+        src_key_padding_mask: Optional[List[Tensor]] = None,
+        src_pos: Optional[List[Tensor]] = None,
+        prompt_key_padding_mask: Optional[Tensor] = None,
+        prompt_pos: Optional[Tensor] = None,
+        feat_sizes: Optional[List[int]] = None,
+        encoder_extra_kwargs: Optional[Dict] = None,
+        prompt_group_size: int = 1,
+    ):
+        prompt_batch = prompt.shape[1]
+        img_batch = src[0].shape[0] if src[0].dim() == 4 else src[0].shape[1]
+        if prompt_batch != img_batch * prompt_group_size:
+            raise ValueError("prompt batch must equal img_batch * prompt_group_size")
+
+        prompt = prompt.view(prompt.shape[0], img_batch, prompt_group_size, -1)
+        if prompt_key_padding_mask is not None:
+            prompt_key_padding_mask = prompt_key_padding_mask.view(
+                img_batch, prompt_group_size, -1
+            )
+
+        memory_list = []
+        padding_list = []
+        pos_list = []
+        valid_ratios_list = []
+        level_start_index = None
+        spatial_shapes = None
+
+        for idx in range(prompt_group_size):
+            group_prompt = prompt[:, :, idx, :]
+            group_mask = (
+                prompt_key_padding_mask[:, idx, :]
+                if prompt_key_padding_mask is not None
+                else None
+            )
+            out = self._forward_single_prompt(
+                src=src,
+                prompt=group_prompt,
+                src_key_padding_mask=src_key_padding_mask,
+                src_pos=src_pos,
+                prompt_key_padding_mask=group_mask,
+                prompt_pos=prompt_pos,
+                feat_sizes=feat_sizes,
+                encoder_extra_kwargs=encoder_extra_kwargs,
+            )
+            memory_list.append(out["memory"])
+            padding_list.append(out["padding_mask"])
+            pos_list.append(out["pos_embed"])
+            valid_ratios_list.append(out["valid_ratios"])
+            if level_start_index is None:
+                level_start_index = out["level_start_index"]
+            if spatial_shapes is None:
+                spatial_shapes = out["spatial_shapes"]
+
+        memory = torch.cat(memory_list, dim=1)
+        padding_mask = (
+            torch.cat(padding_list, dim=1) if padding_list[0] is not None else None
+        )
+        pos_embed = torch.cat(pos_list, dim=1)
+        valid_ratios = torch.cat(valid_ratios_list, dim=0)
+        prompt_flat = prompt.reshape(prompt.shape[0], img_batch * prompt_group_size, -1)
+
+        return {
+            "memory": memory,
+            "padding_mask": padding_mask,
+            "pos_embed": pos_embed,
+            "memory_text": prompt_flat,
             "level_start_index": level_start_index,
             "spatial_shapes": spatial_shapes,
             "valid_ratios": valid_ratios,

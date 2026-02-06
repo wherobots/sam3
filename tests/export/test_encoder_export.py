@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import copy
+
 import pytest
 import torch
+from torch import nn
 
 from sam3.model.encoder import TransformerEncoderFusion
 from tests.export.utils import capture_stderr_on_fail, get_device
@@ -37,6 +40,54 @@ class EncoderFusionWrapper(torch.nn.Module):
         )
 
 
+class EncoderFusionMultiLevelWrapper(torch.nn.Module):
+    def __init__(self, encoder: TransformerEncoderFusion):
+        super().__init__()
+        self.encoder = encoder
+
+    def forward(self, img_feats, img_pos, img_mask, prompt, prompt_mask):
+        out = self.encoder(
+            src=img_feats,
+            src_pos=img_pos,
+            src_key_padding_mask=img_mask,
+            prompt=prompt,
+            prompt_key_padding_mask=prompt_mask,
+        )
+        return (
+            out["memory"],
+            out["pos_embed"],
+            out["padding_mask"],
+            out["level_start_index"],
+            out["spatial_shapes"],
+            out["valid_ratios"],
+        )
+
+
+class EncoderFusionBroadcastWrapper(torch.nn.Module):
+    def __init__(self, encoder: TransformerEncoderFusion, prompt_group_size: int):
+        super().__init__()
+        self.encoder = encoder
+        self.prompt_group_size = prompt_group_size
+
+    def forward(self, img_feats, img_pos, img_mask, prompt, prompt_mask):
+        out = self.encoder(
+            src=[img_feats],
+            src_pos=[img_pos],
+            src_key_padding_mask=[img_mask],
+            prompt=prompt,
+            prompt_key_padding_mask=prompt_mask,
+            prompt_group_size=self.prompt_group_size,
+        )
+        return (
+            out["memory"],
+            out["pos_embed"],
+            out["padding_mask"],
+            out["level_start_index"],
+            out["spatial_shapes"],
+            out["valid_ratios"],
+        )
+
+
 def _make_image_tokens(batch: int, height: int, width: int, device: str):
     channels = 256
     img_feats = torch.randn(batch, channels, height, width, device=device)
@@ -48,6 +99,33 @@ def _make_image_tokens(batch: int, height: int, width: int, device: str):
 def _make_prompt(batch: int, seq_len: int, device: str):
     prompt = torch.randn(seq_len, batch, 256, device=device)
     prompt_mask = torch.zeros(batch, seq_len, dtype=torch.bool, device=device)
+    return prompt, prompt_mask
+
+
+def _make_multilevel_tokens(batch: int, sizes, device: str):
+    channels = 256
+    img_feats = [
+        torch.randn(batch, channels, height, width, device=device)
+        for height, width in sizes
+    ]
+    img_pos = [
+        torch.randn(batch, channels, height, width, device=device)
+        for height, width in sizes
+    ]
+    img_mask = [
+        torch.zeros(batch, height, width, dtype=torch.bool, device=device)
+        for height, width in sizes
+    ]
+    return img_feats, img_pos, img_mask
+
+
+def _make_broadcast_prompt(
+    batch: int, prompts_per_image: int, seq_len: int, device: str
+):
+    prompt = torch.randn(seq_len, batch * prompts_per_image, 256, device=device)
+    prompt_mask = torch.zeros(
+        batch * prompts_per_image, seq_len, dtype=torch.bool, device=device
+    )
     return prompt, prompt_mask
 
 
@@ -177,3 +255,80 @@ def test_encoder_export_inference_shapes(sam3_model, batch: int, seq_len: int):
     with torch.no_grad():
         out = module(img_feats2, img_pos2, img_mask2, prompt2, prompt_mask2)
     assert isinstance(out, tuple)
+
+
+@pytest.mark.parametrize(
+    "num_levels,sizes",
+    [
+        (1, [(72, 72)]),
+        (4, [(288, 288), (144, 144), (72, 72), (36, 36)]),
+    ],
+)
+def test_encoder_export_multilevel(sam3_model, num_levels: int, sizes):
+    device = get_device()
+    encoder = copy.deepcopy(sam3_model.transformer.encoder)
+    encoder.num_feature_levels = num_levels
+    if num_levels > 1:
+        encoder.level_embed = nn.Parameter(
+            torch.zeros(num_levels, encoder.layers[0].d_model)
+        )
+    else:
+        encoder.level_embed = None
+
+    wrapper = EncoderFusionMultiLevelWrapper(encoder).to(device).eval()
+    img_feats, img_pos, img_mask = _make_multilevel_tokens(1, sizes, device)
+    prompt, prompt_mask = _make_prompt(1, 4, device)
+    with torch.no_grad():
+        eager_out = wrapper(img_feats, img_pos, img_mask, prompt, prompt_mask)
+    with capture_stderr_on_fail("export_multilevel"):
+        exported = torch.export.export(
+            wrapper,
+            (img_feats, img_pos, img_mask, prompt, prompt_mask),
+            strict=False,
+            prefer_deferred_runtime_asserts_over_guards=True,
+        )
+    module = exported.module()
+    with torch.no_grad():
+        export_out = module(img_feats, img_pos, img_mask, prompt, prompt_mask)
+    for eager, compiled in zip(eager_out, export_out):
+        torch.testing.assert_close(eager, compiled, rtol=1e-3, atol=1e-3)
+
+
+def test_encoder_export_broadcast_equivalence(sam3_model):
+    device = get_device()
+    encoder = copy.deepcopy(sam3_model.transformer.encoder)
+    encoder.num_feature_levels = 1
+    encoder.level_embed = None
+    wrapper = (
+        EncoderFusionBroadcastWrapper(encoder, prompt_group_size=2).to(device).eval()
+    )
+
+    img_feats, img_pos, img_mask = _make_image_tokens(1, 72, 72, device)
+    prompt, prompt_mask = _make_broadcast_prompt(1, 2, 4, device)
+
+    img_feats_dup = img_feats.repeat(2, 1, 1, 1)
+    img_pos_dup = img_pos.repeat(2, 1, 1, 1)
+    img_mask_dup = img_mask.repeat(2, 1, 1)
+
+    baseline_wrapper = EncoderFusionWrapper(encoder).to(device).eval()
+
+    with torch.no_grad():
+        eager_baseline = baseline_wrapper(
+            img_feats_dup, img_pos_dup, img_mask_dup, prompt, prompt_mask
+        )
+        eager_out = wrapper(img_feats, img_pos, img_mask, prompt, prompt_mask)
+
+    for eager, baseline in zip(eager_out, eager_baseline):
+        torch.testing.assert_close(eager, baseline, rtol=1e-3, atol=1e-3)
+    with capture_stderr_on_fail("export_broadcast_equivalence"):
+        exported = torch.export.export(
+            wrapper,
+            (img_feats, img_pos, img_mask, prompt, prompt_mask),
+            strict=False,
+            prefer_deferred_runtime_asserts_over_guards=True,
+        )
+    module = exported.module()
+    with torch.no_grad():
+        export_out = module(img_feats, img_pos, img_mask, prompt, prompt_mask)
+    for eager, compiled in zip(eager_out, export_out):
+        torch.testing.assert_close(eager, compiled, rtol=1e-3, atol=1e-3)
