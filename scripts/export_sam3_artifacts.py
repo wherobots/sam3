@@ -60,22 +60,7 @@ def _make_inputs(model, image: torch.Tensor, prompts):
 
 def _save_export(exported, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    exported.save(str(path))
-
-
-def _export_encoder_multilevel(
-    model, img_feats, img_pos, img_mask, prompt, prompt_mask
-):
-    device = prompt.device
-    wrapper = EncoderFusionWrapper(model.transformer.encoder).to(device).eval()
-    with torch.no_grad():
-        exported = torch.export.export(
-            wrapper,
-            (img_feats, img_pos, img_mask, prompt, prompt_mask),
-            strict=False,
-            prefer_deferred_runtime_asserts_over_guards=True,
-        )
-    return exported
+    torch.export.save(exported, str(path))
 
 
 def main() -> None:
@@ -126,25 +111,46 @@ def main() -> None:
     with torch.no_grad():
         image_module = image_encoder.module()
         text_module = text_encoder.module()
-        vision_features, vision_pos_enc, _ = image_module(inputs[0])
+        _, vision_pos_enc, backbone_fpn = image_module(inputs[0])
         text_attention_mask, text_memory = text_module(inputs[1])
         prompt = text_memory
         prompt_mask = text_attention_mask
-        img_mask = [
-            torch.zeros(
-                feat.shape[0],
-                feat.shape[2],
-                feat.shape[3],
-                device=feat.device,
-                dtype=torch.bool,
-            )
-            for feat in vision_features
-        ]
-    encoder = _export_encoder_multilevel(
-        model, vision_features, vision_pos_enc, img_mask, prompt, prompt_mask
+        img_feats = backbone_fpn[-1]
+        img_pos = vision_pos_enc[-1]
+        img_mask = torch.zeros(
+            img_feats.shape[0],
+            img_feats.shape[2],
+            img_feats.shape[3],
+            device=img_feats.device,
+            dtype=torch.bool,
+        )
+    prompt_batch = prompt.shape[1]
+    if img_feats.shape[0] != prompt_batch:
+        if img_feats.shape[0] != 1:
+            raise ValueError("Image batch does not match prompt batch")
+        img_feats = img_feats.repeat(prompt_batch, 1, 1, 1)
+        img_pos = img_pos.repeat(prompt_batch, 1, 1, 1)
+        img_mask = img_mask.repeat(prompt_batch, 1, 1)
+
+    encoder_wrapper = (
+        EncoderFusionWrapper(model.transformer.encoder).to(img_feats.device).eval()
+    )
+    encoder = torch.export.export(
+        encoder_wrapper,
+        (img_feats, img_pos, img_mask, prompt, prompt_mask),
+        dynamic_shapes={
+            "img_feats": {0: torch.export.Dim("batch", min=1, max=4)},
+            "img_pos": {0: torch.export.Dim("batch", min=1, max=4)},
+            "img_mask": {0: torch.export.Dim("batch", min=1, max=4)},
+            "prompt": {0: 32, 1: torch.export.Dim("batch", min=1, max=4)},
+            "prompt_mask": {0: torch.export.Dim("batch", min=1, max=4), 1: 32},
+        },
+        strict=False,
+        prefer_deferred_runtime_asserts_over_guards=True,
     )
     print("Exporting decoder...")
-    decoder = _export_decoder(model, inputs)
+    decoder_inputs = _make_inputs(model, image, prompts[:1])
+    decoder = _export_decoder(model, decoder_inputs)
 
     _save_export(image_encoder, args.out_dir / "image_encoder.pt2")
     _save_export(text_encoder, args.out_dir / "text_encoder.pt2")

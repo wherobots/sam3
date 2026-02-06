@@ -1,11 +1,11 @@
 import argparse
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
 import torch
 from PIL import Image
-from PIL import ImageDraw
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
@@ -99,12 +99,7 @@ def _run_full_model(model, inputs):
         find_target=None,
         geometric_prompt=geometric_prompt,
     )
-    return (
-        out["pred_masks"],
-        out["pred_boxes"],
-        out["pred_logits"],
-        out["pred_boxes_xyxy"],
-    )
+    return out["pred_masks"], out["pred_boxes"], out["pred_logits"]
 
 
 def _load_export(path: Path):
@@ -112,60 +107,16 @@ def _load_export(path: Path):
     return exported.module()
 
 
-def _to_pil_image(image: torch.Tensor) -> Image.Image:
-    image = image.detach().cpu().clamp(0, 1)
-    np_image = (image.permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
-    return Image.fromarray(np_image)
-
-
-def _color_palette(num_colors: int):
-    base = [
-        (255, 99, 71),
-        (65, 105, 225),
-        (60, 179, 113),
-        (238, 130, 238),
-        (255, 215, 0),
-        (255, 165, 0),
-    ]
-    return [base[i % len(base)] for i in range(num_colors)]
-
-
-def _overlay_masks(
-    image: Image.Image, masks: torch.Tensor, scores: torch.Tensor, out_path: Path
-):
-    num_prompts, num_queries = scores.shape[:2]
-    best_idx = scores.squeeze(-1).argmax(dim=1)
-    colors = _color_palette(num_prompts)
-    base = image.copy().convert("RGBA")
-    overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
-    for i in range(num_prompts):
-        mask = masks[i, best_idx[i]].detach().cpu()
-        mask = mask > 0
-        mask_img = Image.fromarray((mask.numpy() * 255).astype(np.uint8), mode="L")
-        if mask_img.size != base.size:
-            mask_img = mask_img.resize(base.size, resample=Image.Resampling.NEAREST)
-        color = colors[i]
-        color_img = Image.new("RGBA", base.size, (*color, 120))
-        overlay = Image.composite(color_img, overlay, mask_img)
-    blended = Image.alpha_composite(base, overlay)
-    blended.convert("RGB").save(out_path)
-
-
-def _draw_boxes(
-    image: Image.Image, boxes_xyxy: torch.Tensor, scores: torch.Tensor, out_path: Path
-):
-    num_prompts, num_queries = scores.shape[:2]
-    best_idx = scores.squeeze(-1).argmax(dim=1).clamp(max=boxes_xyxy.shape[1] - 1)
-    colors = _color_palette(num_prompts)
-    draw = ImageDraw.Draw(image)
-    for i in range(num_prompts):
-        box_tensor = boxes_xyxy[i, best_idx[i]].detach().cpu().flatten()
-        if box_tensor.numel() != 4:
-            continue
-        box = box_tensor.tolist()
-        color = colors[i]
-        draw.rectangle(box, outline=color, width=3)
-    image.save(out_path)
+def _timeit(fn, iters: int, device: torch.device):
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    start = time.perf_counter()
+    for _ in range(iters):
+        fn()
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    end = time.perf_counter()
+    return (end - start) / iters
 
 
 def main() -> None:
@@ -193,26 +144,23 @@ def main() -> None:
         default=Path("artifacts/export"),
         help="Directory with exported artifacts",
     )
+    parser.add_argument("--warmup", type=int, default=3)
+    parser.add_argument("--iters", type=int, default=10)
     args = parser.parse_args()
 
     prompts = [p.strip() for p in args.prompts.split(",") if p.strip()]
     if not prompts:
         raise ValueError("Provide at least one prompt")
-    prompt_count = len(prompts)
 
     model = build_sam3_image_model(
         device=args.device, eval_mode=True, enable_segmentation=True
     )
     model.eval()
 
-    image = _load_image(args.image, torch.device(args.device))
+    device = torch.device(args.device)
+    image = _load_image(args.image, device)
     image = _prepare_image(image, size=1008)
     inputs = _make_inputs(model, image, prompts)
-
-    with torch.no_grad():
-        eager_masks, eager_boxes, eager_logits, eager_boxes_xyxy = _run_full_model(
-            model, inputs
-        )
 
     image_module = _load_export(args.artifact_dir / "image_encoder.pt2")
     text_module = _load_export(args.artifact_dir / "text_encoder.pt2")
@@ -220,16 +168,66 @@ def main() -> None:
     decoder_module = _load_export(args.artifact_dir / "decoder.pt2")
 
     with torch.no_grad():
-        _, vision_pos_enc, backbone_fpn = image_module(inputs[0])
+        # Warmup
+        for _ in range(args.warmup):
+            _run_full_model(model, inputs)
+            vision_pos_enc = image_module(inputs[0])[1]
+            backbone_fpn = image_module(inputs[0])[2]
+            text_attention_mask, text_memory = text_module(inputs[1])
+            img_feats = backbone_fpn[-1]
+            img_pos = vision_pos_enc[-1]
+            img_mask = torch.zeros(
+                img_feats.shape[0],
+                img_feats.shape[2],
+                img_feats.shape[3],
+                device=img_feats.device,
+                dtype=torch.bool,
+            )
+            encoder_module(
+                img_feats, img_pos, img_mask, text_memory, text_attention_mask
+            )
+            (
+                images,
+                token_ids,
+                img_ids,
+                text_ids,
+                box_embeddings,
+                box_mask,
+                box_labels,
+            ) = inputs
+            if token_ids.shape[0] < 2:
+                repeat = 2 // token_ids.shape[0]
+                token_ids = token_ids.repeat(repeat, 1)
+                img_ids = img_ids.repeat(repeat)
+                text_ids = text_ids.repeat(repeat)
+                box_embeddings = box_embeddings.repeat(1, repeat, 1)
+                box_mask = box_mask.repeat(repeat, 1)
+                box_labels = box_labels.repeat(1, repeat)
+            decoder_module(
+                images,
+                token_ids,
+                img_ids,
+                text_ids,
+                box_embeddings,
+                box_mask,
+                box_labels,
+            )
+
+    def eager_fn():
+        _run_full_model(model, inputs)
+
+    def image_fn():
+        image_module(inputs[0])
+
+    def text_fn():
+        text_module(inputs[1])
+
+    def encoder_fn():
+        vision_pos_enc = image_module(inputs[0])[1]
+        backbone_fpn = image_module(inputs[0])[2]
         text_attention_mask, text_memory = text_module(inputs[1])
         img_feats = backbone_fpn[-1]
         img_pos = vision_pos_enc[-1]
-        prompt_batch = text_attention_mask.shape[0]
-        if img_feats.shape[0] != prompt_batch:
-            if img_feats.shape[0] != 1:
-                raise ValueError("Image batch does not match prompt batch")
-            img_feats = img_feats.repeat(prompt_batch, 1, 1, 1)
-            img_pos = img_pos.repeat(prompt_batch, 1, 1, 1)
         img_mask = torch.zeros(
             img_feats.shape[0],
             img_feats.shape[2],
@@ -237,10 +235,9 @@ def main() -> None:
             device=img_feats.device,
             dtype=torch.bool,
         )
-        enc_out = encoder_module(
-            img_feats, img_pos, img_mask, text_memory, text_attention_mask
-        )
-        assert isinstance(enc_out, tuple)
+        encoder_module(img_feats, img_pos, img_mask, text_memory, text_attention_mask)
+
+    def decoder_fn():
         (
             images,
             token_ids,
@@ -258,7 +255,7 @@ def main() -> None:
             box_embeddings = box_embeddings.repeat(1, repeat, 1)
             box_mask = box_mask.repeat(repeat, 1)
             box_labels = box_labels.repeat(1, repeat)
-        decoder_inputs = (
+        decoder_module(
             images,
             token_ids,
             img_ids,
@@ -267,54 +264,18 @@ def main() -> None:
             box_mask,
             box_labels,
         )
-        pred_logits, pred_boxes, pred_masks, pred_boxes_xyxy = decoder_module(
-            *decoder_inputs
-        )
-        eager_ref_masks, eager_ref_boxes, eager_ref_logits, eager_ref_boxes_xyxy = (
-            _run_full_model(model, decoder_inputs)
-        )
 
-    pred_logits = pred_logits[:prompt_count]
-    pred_boxes = pred_boxes[:prompt_count]
-    pred_masks = pred_masks[:prompt_count]
-    pred_boxes_xyxy = pred_boxes_xyxy[:prompt_count]
-    eager_ref_logits = eager_ref_logits[:prompt_count]
+    eager_ms = _timeit(eager_fn, args.iters, device) * 1000
+    image_ms = _timeit(image_fn, args.iters, device) * 1000
+    text_ms = _timeit(text_fn, args.iters, device) * 1000
+    encoder_ms = _timeit(encoder_fn, args.iters, device) * 1000
+    decoder_ms = _timeit(decoder_fn, args.iters, device) * 1000
 
-    print("Prompt count:", prompt_count)
-    print("Pred logits shape:", pred_logits.shape)
-    print("Pred boxes shape:", pred_boxes.shape)
-    print("Pred masks shape:", pred_masks.shape)
-    torch.testing.assert_close(pred_logits, eager_ref_logits, rtol=1e-3, atol=1e-3)
-    print("Eager vs export logits match")
-
-    out_dir = args.artifact_dir
-    out_dir.mkdir(parents=True, exist_ok=True)
-    base_image = _to_pil_image(inputs[0][0])
-    _overlay_masks(
-        base_image.copy(),
-        eager_masks,
-        eager_logits,
-        out_dir / "eager_masks_overlay.jpg",
-    )
-    _overlay_masks(
-        base_image.copy(),
-        pred_masks,
-        pred_logits,
-        out_dir / "export_masks_overlay.jpg",
-    )
-    _draw_boxes(
-        base_image.copy(),
-        eager_boxes_xyxy,
-        eager_logits,
-        out_dir / "eager_boxes_overlay.jpg",
-    )
-    _draw_boxes(
-        base_image.copy(),
-        pred_boxes_xyxy,
-        pred_logits,
-        out_dir / "export_boxes_overlay.jpg",
-    )
-    print("Saved overlays to", out_dir)
+    print("Eager total (ms):", round(eager_ms, 2))
+    print("Export image encoder (ms):", round(image_ms, 2))
+    print("Export text encoder (ms):", round(text_ms, 2))
+    print("Export encoder fusion (ms):", round(encoder_ms, 2))
+    print("Export decoder (ms):", round(decoder_ms, 2))
 
 
 if __name__ == "__main__":
