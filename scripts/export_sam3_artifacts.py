@@ -10,7 +10,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 from sam3.model_builder import build_sam3_image_model
-from tests.export.test_decoder_export import _export_decoder
+from tests.export.test_decoder_export import (
+    _export_decoder_only,
+    _export_full_sam3_pipeline,
+    _make_decoder_only_inputs,
+)
 from tests.export.test_encoder_export import EncoderFusionWrapper
 from tests.export.test_image_encoder_export import _export_image_encoder
 from tests.export.test_text_encoder_export import _export_text_encoder
@@ -36,12 +40,15 @@ def _prepare_image(image: torch.Tensor, size: int) -> torch.Tensor:
 def _make_inputs(model, image: torch.Tensor, prompts):
     device = image.device
     num_prompts = len(prompts)
+    num_images = int(image.shape[0])
 
     tokenizer = model.backbone.language_backbone.tokenizer
     token_ids = tokenizer(prompts, context_length=32).to(device)
 
-    img_ids = torch.zeros(num_prompts, device=device, dtype=torch.long)
-    text_ids = torch.zeros(num_prompts, device=device, dtype=torch.long)
+    img_ids = torch.arange(num_images, device=device, dtype=torch.long)
+    img_ids = img_ids.repeat_interleave(num_prompts)
+    text_ids = torch.arange(num_prompts, device=device, dtype=torch.long)
+    text_ids = text_ids.repeat(num_images)
 
     box_embeddings = torch.zeros(1, num_prompts, 4, device=device)
     box_mask = torch.zeros(num_prompts, 1, device=device, dtype=torch.bool)
@@ -148,14 +155,49 @@ def main() -> None:
         strict=False,
         prefer_deferred_runtime_asserts_over_guards=True,
     )
-    print("Exporting decoder...")
-    decoder_inputs = _make_inputs(model, image, prompts[:1])
-    decoder = _export_decoder(model, decoder_inputs)
+    print("Exporting full pipeline...")
+    pipeline_inputs = _make_inputs(model, image, prompts[:1])
+    full_pipeline = _export_full_sam3_pipeline(model, pipeline_inputs)
+    print("Exporting decoder only...")
+    decoder_inputs = _make_decoder_only_inputs(model, pipeline_inputs)
+    (
+        backbone_fpn,
+        img_ids,
+        memory,
+        pos_embed,
+        prompt,
+        prompt_mask,
+        level_start_index,
+        spatial_shapes,
+        valid_ratios,
+    ) = decoder_inputs
+    if img_ids.shape[0] < 2:
+        repeat = 2 // img_ids.shape[0]
+        img_ids = img_ids.repeat(repeat)
+        memory = memory.repeat(1, repeat, 1)
+        pos_embed = pos_embed.repeat(1, repeat, 1)
+        prompt = prompt.repeat(1, repeat, 1)
+        prompt_mask = prompt_mask.repeat(repeat, 1)
+        valid_ratios = valid_ratios.repeat(repeat, 1, 1)
+        backbone_fpn = [feat.repeat(repeat, 1, 1, 1) for feat in backbone_fpn]
+    decoder_inputs = (
+        backbone_fpn,
+        img_ids,
+        memory,
+        pos_embed,
+        prompt,
+        prompt_mask,
+        level_start_index,
+        spatial_shapes,
+        valid_ratios,
+    )
+    decoder_only = _export_decoder_only(model, decoder_inputs)
 
     _save_export(image_encoder, args.out_dir / "image_encoder.pt2")
     _save_export(text_encoder, args.out_dir / "text_encoder.pt2")
     _save_export(encoder, args.out_dir / "encoder_fusion.pt2")
-    _save_export(decoder, args.out_dir / "decoder.pt2")
+    _save_export(full_pipeline, args.out_dir / "full_sam3_pipeline.pt2")
+    _save_export(decoder_only, args.out_dir / "decoder_only.pt2")
     print("Saved exports to", args.out_dir)
 
 

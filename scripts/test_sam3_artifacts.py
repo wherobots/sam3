@@ -15,11 +15,18 @@ from sam3.model.data_misc import FindStage
 from sam3.model.geometry_encoders import Prompt
 
 
-def _load_image(path: Path, device: torch.device) -> torch.Tensor:
-    image = Image.open(path).convert("RGB")
+def _load_pil_image(path: Path) -> Image.Image:
+    return Image.open(path).convert("RGB")
+
+
+def _pil_to_tensor(image: Image.Image, device: torch.device) -> torch.Tensor:
     np_image = np.array(image, dtype=np.float32) / 255.0
     tensor = torch.from_numpy(np_image).permute(2, 0, 1).unsqueeze(0)
     return tensor.to(device)
+
+
+def _load_image(path: Path, device: torch.device) -> torch.Tensor:
+    return _pil_to_tensor(_load_pil_image(path), device)
 
 
 def _prepare_image(image: torch.Tensor, size: int) -> torch.Tensor:
@@ -35,12 +42,15 @@ def _prepare_image(image: torch.Tensor, size: int) -> torch.Tensor:
 def _make_inputs(model, image: torch.Tensor, prompts):
     device = image.device
     num_prompts = len(prompts)
+    num_images = int(image.shape[0])
 
     tokenizer = model.backbone.language_backbone.tokenizer
     token_ids = tokenizer(prompts, context_length=32).to(device)
 
-    img_ids = torch.zeros(num_prompts, device=device, dtype=torch.long)
-    text_ids = torch.zeros(num_prompts, device=device, dtype=torch.long)
+    img_ids = torch.arange(num_images, device=device, dtype=torch.long)
+    img_ids = img_ids.repeat_interleave(num_prompts)
+    text_ids = torch.arange(num_prompts, device=device, dtype=torch.long)
+    text_ids = text_ids.repeat(num_images)
 
     box_embeddings = torch.zeros(1, num_prompts, 4, device=device)
     box_mask = torch.zeros(num_prompts, 1, device=device, dtype=torch.bool)
@@ -107,6 +117,64 @@ def _run_full_model(model, inputs):
     )
 
 
+def _make_decoder_only_inputs_from_model(
+    model,
+    backbone_fpn,
+    vision_pos_enc,
+    text_memory,
+    text_attention_mask,
+    inputs,
+):
+    (
+        images,
+        token_ids,
+        img_ids,
+        text_ids,
+        box_embeddings,
+        box_mask,
+        box_labels,
+    ) = inputs
+    backbone_out = {
+        "backbone_fpn": backbone_fpn,
+        "vision_pos_enc": vision_pos_enc,
+        "language_features": text_memory,
+        "language_mask": text_attention_mask,
+    }
+    find_input = FindStage(
+        img_ids=img_ids,
+        text_ids=text_ids,
+        input_boxes=box_embeddings,
+        input_boxes_mask=box_mask,
+        input_boxes_label=box_labels,
+        input_points=torch.zeros(0, int(token_ids.shape[0]), 2, device=images.device),
+        input_points_mask=torch.zeros(
+            int(token_ids.shape[0]), 0, device=images.device, dtype=torch.bool
+        ),
+    )
+    geometric_prompt = Prompt(
+        box_embeddings=box_embeddings,
+        box_mask=box_mask,
+        box_labels=box_labels,
+    )
+    prompt, prompt_mask, backbone_out = model._encode_prompt(
+        backbone_out, find_input, geometric_prompt
+    )
+    backbone_out, encoder_out, _ = model._run_encoder(
+        backbone_out, find_input, prompt, prompt_mask
+    )
+    return (
+        backbone_out["backbone_fpn"],
+        img_ids,
+        encoder_out["encoder_hidden_states"],
+        encoder_out["pos_embed"],
+        prompt,
+        prompt_mask,
+        encoder_out["level_start_index"],
+        encoder_out["spatial_shapes"],
+        encoder_out["valid_ratios"],
+    )
+
+
 def _load_export(path: Path):
     exported = torch.export.load(str(path))
     return exported.module()
@@ -163,6 +231,20 @@ def _draw_boxes(
         if box_tensor.numel() != 4:
             continue
         box = box_tensor.tolist()
+        width, height = image.size
+        if max(box) <= 1.0:
+            box = [
+                box[0] * width,
+                box[1] * height,
+                box[2] * width,
+                box[3] * height,
+            ]
+        box = [
+            max(0.0, min(box[0], width)),
+            max(0.0, min(box[1], height)),
+            max(0.0, min(box[2], width)),
+            max(0.0, min(box[3], height)),
+        ]
         color = colors[i]
         draw.rectangle(box, outline=color, width=3)
     image.save(out_path)
@@ -205,7 +287,8 @@ def main() -> None:
     )
     model.eval()
 
-    image = _load_image(args.image, torch.device(args.device))
+    pil_image = _load_pil_image(args.image)
+    image = _pil_to_tensor(pil_image, torch.device(args.device))
     image = _prepare_image(image, size=1008)
     inputs = _make_inputs(model, image, prompts)
 
@@ -217,7 +300,8 @@ def main() -> None:
     image_module = _load_export(args.artifact_dir / "image_encoder.pt2")
     text_module = _load_export(args.artifact_dir / "text_encoder.pt2")
     encoder_module = _load_export(args.artifact_dir / "encoder_fusion.pt2")
-    decoder_module = _load_export(args.artifact_dir / "decoder.pt2")
+    pipeline_module = _load_export(args.artifact_dir / "full_sam3_pipeline.pt2")
+    decoder_module = _load_export(args.artifact_dir / "decoder_only.pt2")
 
     with torch.no_grad():
         _, vision_pos_enc, backbone_fpn = image_module(inputs[0])
@@ -267,8 +351,49 @@ def main() -> None:
             box_mask,
             box_labels,
         )
+        pipeline_logits, pipeline_boxes, pipeline_masks, pipeline_boxes_xyxy = (
+            pipeline_module(*decoder_inputs)
+        )
+        (
+            decoder_backbone_fpn,
+            decoder_img_ids,
+            decoder_memory,
+            decoder_pos_embed,
+            decoder_prompt,
+            decoder_prompt_mask,
+            decoder_level_start_index,
+            decoder_spatial_shapes,
+            decoder_valid_ratios,
+        ) = _make_decoder_only_inputs_from_model(
+            model,
+            backbone_fpn,
+            vision_pos_enc,
+            text_memory,
+            text_attention_mask,
+            inputs,
+        )
+        batch_target = decoder_img_ids.shape[0]
+        if batch_target < 2:
+            repeat = 2 // batch_target
+            decoder_img_ids = decoder_img_ids.repeat(repeat)
+            decoder_memory = decoder_memory.repeat(1, repeat, 1)
+            decoder_pos_embed = decoder_pos_embed.repeat(1, repeat, 1)
+            decoder_prompt = decoder_prompt.repeat(1, repeat, 1)
+            decoder_prompt_mask = decoder_prompt_mask.repeat(repeat, 1)
+            decoder_valid_ratios = decoder_valid_ratios.repeat(repeat, 1, 1)
+            decoder_backbone_fpn = [
+                feat.repeat(repeat, 1, 1, 1) for feat in decoder_backbone_fpn
+            ]
         pred_logits, pred_boxes, pred_masks, pred_boxes_xyxy = decoder_module(
-            *decoder_inputs
+            decoder_backbone_fpn,
+            decoder_img_ids,
+            decoder_memory,
+            decoder_pos_embed,
+            decoder_prompt,
+            decoder_prompt_mask,
+            decoder_level_start_index,
+            decoder_spatial_shapes,
+            decoder_valid_ratios,
         )
         eager_ref_masks, eager_ref_boxes, eager_ref_logits, eager_ref_boxes_xyxy = (
             _run_full_model(model, decoder_inputs)
@@ -278,18 +403,34 @@ def main() -> None:
     pred_boxes = pred_boxes[:prompt_count]
     pred_masks = pred_masks[:prompt_count]
     pred_boxes_xyxy = pred_boxes_xyxy[:prompt_count]
+    pipeline_logits = pipeline_logits[:prompt_count]
+    pipeline_masks = pipeline_masks[:prompt_count]
+    pipeline_boxes_xyxy = pipeline_boxes_xyxy[:prompt_count]
     eager_ref_logits = eager_ref_logits[:prompt_count]
 
     print("Prompt count:", prompt_count)
     print("Pred logits shape:", pred_logits.shape)
     print("Pred boxes shape:", pred_boxes.shape)
     print("Pred masks shape:", pred_masks.shape)
+    pred_scores = pred_logits.squeeze(-1)
+    eager_scores = eager_ref_logits.squeeze(-1)
+    pred_max = pred_scores.max(dim=1).values
+    eager_max = eager_scores.max(dim=1).values
+    pred_best_idx = pred_scores.argmax(dim=1)
+    eager_best_idx = eager_scores.argmax(dim=1)
+    for idx, prompt_text in enumerate(prompts):
+        print(
+            f"Prompt '{prompt_text}' max logit: "
+            f"export={pred_max[idx].item():.4f} (idx {pred_best_idx[idx].item()}), "
+            f"eager={eager_max[idx].item():.4f} (idx {eager_best_idx[idx].item()})"
+        )
     torch.testing.assert_close(pred_logits, eager_ref_logits, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(pipeline_logits, eager_ref_logits, rtol=1e-3, atol=1e-3)
     print("Eager vs export logits match")
 
     out_dir = args.artifact_dir
     out_dir.mkdir(parents=True, exist_ok=True)
-    base_image = _to_pil_image(inputs[0][0])
+    base_image = pil_image.copy()
     _overlay_masks(
         base_image.copy(),
         eager_masks,
@@ -298,10 +439,35 @@ def main() -> None:
     )
     _overlay_masks(
         base_image.copy(),
+        pipeline_masks,
+        pipeline_logits,
+        out_dir / "pipeline_masks_overlay.jpg",
+    )
+    _overlay_masks(
+        base_image.copy(),
         pred_masks,
         pred_logits,
-        out_dir / "export_masks_overlay.jpg",
+        out_dir / "decoder_only_masks_overlay.jpg",
     )
+    for idx, prompt_text in enumerate(prompts):
+        _overlay_masks(
+            base_image.copy(),
+            eager_masks[idx : idx + 1],
+            eager_logits[idx : idx + 1],
+            out_dir / f"eager_mask_overlay_{idx}.jpg",
+        )
+        _overlay_masks(
+            base_image.copy(),
+            pipeline_masks[idx : idx + 1],
+            pipeline_logits[idx : idx + 1],
+            out_dir / f"pipeline_mask_overlay_{idx}.jpg",
+        )
+        _overlay_masks(
+            base_image.copy(),
+            pred_masks[idx : idx + 1],
+            pred_logits[idx : idx + 1],
+            out_dir / f"decoder_only_mask_overlay_{idx}.jpg",
+        )
     _draw_boxes(
         base_image.copy(),
         eager_boxes_xyxy,
@@ -310,9 +476,15 @@ def main() -> None:
     )
     _draw_boxes(
         base_image.copy(),
+        pipeline_boxes_xyxy,
+        pipeline_logits,
+        out_dir / "pipeline_boxes_overlay.jpg",
+    )
+    _draw_boxes(
+        base_image.copy(),
         pred_boxes_xyxy,
         pred_logits,
-        out_dir / "export_boxes_overlay.jpg",
+        out_dir / "decoder_only_boxes_overlay.jpg",
     )
     print("Saved overlays to", out_dir)
 

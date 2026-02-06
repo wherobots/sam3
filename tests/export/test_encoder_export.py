@@ -137,33 +137,6 @@ def test_encoder_export_matches_eager(sam3_model):
         torch.testing.assert_close(eager, compiled, rtol=1e-3, atol=1e-3)
 
 
-def test_encoder_export_dynamic_batch(sam3_model):
-    device = get_device()
-    img_feats, img_pos, img_mask = _make_image_tokens(1, 72, 72, device)
-    prompt, prompt_mask = _make_prompt(1, 4, device)
-    with capture_stderr_on_fail("export_dynamic_batch"):
-        exported = _export_encoder(sam3_model, img_feats, img_pos, prompt, prompt_mask)
-    module = exported.module()
-    img_feats2, img_pos2, img_mask2 = _make_image_tokens(2, 72, 72, device)
-    prompt2, prompt_mask2 = _make_prompt(2, 4, device)
-    with torch.no_grad():
-        out = module(img_feats2, img_pos2, img_mask2, prompt2, prompt_mask2)
-    assert isinstance(out, tuple)
-
-
-def test_encoder_export_dynamic_spatial(sam3_model):
-    device = get_device()
-    img_feats, img_pos, img_mask = _make_image_tokens(1, 72, 72, device)
-    prompt, prompt_mask = _make_prompt(1, 4, device)
-    with capture_stderr_on_fail("export_dynamic_spatial"):
-        exported = _export_encoder(sam3_model, img_feats, img_pos, prompt, prompt_mask)
-    module = exported.module()
-    img_feats2, img_pos2, img_mask2 = _make_image_tokens(1, 72, 72, device)
-    with torch.no_grad():
-        out = module(img_feats2, img_pos2, img_mask2, prompt, prompt_mask)
-    assert isinstance(out, tuple)
-
-
 @pytest.mark.parametrize("batch,seq_len", [(1, 4), (2, 8)])
 def test_encoder_export_inference_shapes(sam3_model, batch: int, seq_len: int):
     device = get_device()

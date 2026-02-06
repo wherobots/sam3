@@ -35,12 +35,15 @@ def _prepare_image(image: torch.Tensor, size: int) -> torch.Tensor:
 def _make_inputs(model, image: torch.Tensor, prompts):
     device = image.device
     num_prompts = len(prompts)
+    num_images = int(image.shape[0])
 
     tokenizer = model.backbone.language_backbone.tokenizer
     token_ids = tokenizer(prompts, context_length=32).to(device)
 
-    img_ids = torch.zeros(num_prompts, device=device, dtype=torch.long)
-    text_ids = torch.zeros(num_prompts, device=device, dtype=torch.long)
+    img_ids = torch.arange(num_images, device=device, dtype=torch.long)
+    img_ids = img_ids.repeat_interleave(num_prompts)
+    text_ids = torch.arange(num_prompts, device=device, dtype=torch.long)
+    text_ids = text_ids.repeat(num_images)
 
     box_embeddings = torch.zeros(1, num_prompts, 4, device=device)
     box_mask = torch.zeros(num_prompts, 1, device=device, dtype=torch.bool)
@@ -100,6 +103,64 @@ def _run_full_model(model, inputs):
         geometric_prompt=geometric_prompt,
     )
     return out["pred_masks"], out["pred_boxes"], out["pred_logits"]
+
+
+def _make_decoder_only_inputs_from_model(
+    model,
+    backbone_fpn,
+    vision_pos_enc,
+    text_memory,
+    text_attention_mask,
+    inputs,
+):
+    (
+        images,
+        token_ids,
+        img_ids,
+        text_ids,
+        box_embeddings,
+        box_mask,
+        box_labels,
+    ) = inputs
+    backbone_out = {
+        "backbone_fpn": backbone_fpn,
+        "vision_pos_enc": vision_pos_enc,
+        "language_features": text_memory,
+        "language_mask": text_attention_mask,
+    }
+    find_input = FindStage(
+        img_ids=img_ids,
+        text_ids=text_ids,
+        input_boxes=box_embeddings,
+        input_boxes_mask=box_mask,
+        input_boxes_label=box_labels,
+        input_points=torch.zeros(0, int(token_ids.shape[0]), 2, device=images.device),
+        input_points_mask=torch.zeros(
+            int(token_ids.shape[0]), 0, device=images.device, dtype=torch.bool
+        ),
+    )
+    geometric_prompt = Prompt(
+        box_embeddings=box_embeddings,
+        box_mask=box_mask,
+        box_labels=box_labels,
+    )
+    prompt, prompt_mask, backbone_out = model._encode_prompt(
+        backbone_out, find_input, geometric_prompt
+    )
+    backbone_out, encoder_out, _ = model._run_encoder(
+        backbone_out, find_input, prompt, prompt_mask
+    )
+    return (
+        backbone_out["backbone_fpn"],
+        img_ids,
+        encoder_out["encoder_hidden_states"],
+        encoder_out["pos_embed"],
+        prompt,
+        prompt_mask,
+        encoder_out["level_start_index"],
+        encoder_out["spatial_shapes"],
+        encoder_out["valid_ratios"],
+    )
 
 
 def _load_export(path: Path):
@@ -162,72 +223,44 @@ def main() -> None:
     image = _prepare_image(image, size=1008)
     inputs = _make_inputs(model, image, prompts)
 
-    image_module = _load_export(args.artifact_dir / "image_encoder.pt2")
-    text_module = _load_export(args.artifact_dir / "text_encoder.pt2")
-    encoder_module = _load_export(args.artifact_dir / "encoder_fusion.pt2")
-    decoder_module = _load_export(args.artifact_dir / "decoder.pt2")
-
-    with torch.no_grad():
-        # Warmup
-        for _ in range(args.warmup):
-            _run_full_model(model, inputs)
-            vision_pos_enc = image_module(inputs[0])[1]
-            backbone_fpn = image_module(inputs[0])[2]
-            text_attention_mask, text_memory = text_module(inputs[1])
-            img_feats = backbone_fpn[-1]
-            img_pos = vision_pos_enc[-1]
-            img_mask = torch.zeros(
-                img_feats.shape[0],
-                img_feats.shape[2],
-                img_feats.shape[3],
-                device=img_feats.device,
-                dtype=torch.bool,
-            )
-            encoder_module(
-                img_feats, img_pos, img_mask, text_memory, text_attention_mask
-            )
-            (
-                images,
-                token_ids,
-                img_ids,
-                text_ids,
-                box_embeddings,
-                box_mask,
-                box_labels,
-            ) = inputs
-            if token_ids.shape[0] < 2:
-                repeat = 2 // token_ids.shape[0]
-                token_ids = token_ids.repeat(repeat, 1)
-                img_ids = img_ids.repeat(repeat)
-                text_ids = text_ids.repeat(repeat)
-                box_embeddings = box_embeddings.repeat(1, repeat, 1)
-                box_mask = box_mask.repeat(repeat, 1)
-                box_labels = box_labels.repeat(1, repeat)
-            decoder_module(
-                images,
-                token_ids,
-                img_ids,
-                text_ids,
-                box_embeddings,
-                box_mask,
-                box_labels,
-            )
+    print("Device (eager):", next(model.parameters()).device)
 
     def eager_fn():
         _run_full_model(model, inputs)
 
+    with torch.inference_mode():
+        for _ in range(args.warmup):
+            eager_fn()
+        eager_ms = _timeit(eager_fn, args.iters, device) * 1000
+
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    image_module = _load_export(args.artifact_dir / "image_encoder.pt2")
+    text_module = _load_export(args.artifact_dir / "text_encoder.pt2")
+    encoder_module = _load_export(args.artifact_dir / "encoder_fusion.pt2")
+    pipeline_module = _load_export(args.artifact_dir / "full_sam3_pipeline.pt2")
+    decoder_module = _load_export(args.artifact_dir / "decoder_only.pt2")
+    print("Device (export):", inputs[0].device)
+
     def image_fn():
-        image_module(inputs[0])
+        return image_module(inputs[0])
 
     def text_fn():
-        text_module(inputs[1])
+        return text_module(inputs[1])
 
-    def encoder_fn():
-        vision_pos_enc = image_module(inputs[0])[1]
-        backbone_fpn = image_module(inputs[0])[2]
-        text_attention_mask, text_memory = text_module(inputs[1])
+    def encoder_from_outputs(image_out, text_out):
+        vision_pos_enc = image_out[1]
+        backbone_fpn = image_out[2]
+        text_attention_mask, text_memory = text_out
         img_feats = backbone_fpn[-1]
         img_pos = vision_pos_enc[-1]
+        prompt_batch = text_attention_mask.shape[0]
+        if img_feats.shape[0] != prompt_batch:
+            if img_feats.shape[0] != 1:
+                raise ValueError("Image batch does not match prompt batch")
+            img_feats = img_feats.repeat(prompt_batch, 1, 1, 1)
+            img_pos = img_pos.repeat(prompt_batch, 1, 1, 1)
         img_mask = torch.zeros(
             img_feats.shape[0],
             img_feats.shape[2],
@@ -237,45 +270,107 @@ def main() -> None:
         )
         encoder_module(img_feats, img_pos, img_mask, text_memory, text_attention_mask)
 
-    def decoder_fn():
-        (
-            images,
-            token_ids,
-            img_ids,
-            text_ids,
-            box_embeddings,
-            box_mask,
-            box_labels,
-        ) = inputs
-        if token_ids.shape[0] < 2:
-            repeat = 2 // token_ids.shape[0]
-            token_ids = token_ids.repeat(repeat, 1)
-            img_ids = img_ids.repeat(repeat)
-            text_ids = text_ids.repeat(repeat)
-            box_embeddings = box_embeddings.repeat(1, repeat, 1)
-            box_mask = box_mask.repeat(repeat, 1)
-            box_labels = box_labels.repeat(1, repeat)
-        decoder_module(
-            images,
-            token_ids,
-            img_ids,
-            text_ids,
-            box_embeddings,
-            box_mask,
-            box_labels,
-        )
+    with torch.inference_mode():
+        cached_image_out = image_fn()
+        cached_text_out = text_fn()
 
-    eager_ms = _timeit(eager_fn, args.iters, device) * 1000
-    image_ms = _timeit(image_fn, args.iters, device) * 1000
-    text_ms = _timeit(text_fn, args.iters, device) * 1000
-    encoder_ms = _timeit(encoder_fn, args.iters, device) * 1000
-    decoder_ms = _timeit(decoder_fn, args.iters, device) * 1000
+    def encoder_fn():
+        encoder_from_outputs(cached_image_out, cached_text_out)
+
+    (
+        pipeline_images,
+        pipeline_token_ids,
+        pipeline_img_ids,
+        pipeline_text_ids,
+        pipeline_box_embeddings,
+        pipeline_box_mask,
+        pipeline_box_labels,
+    ) = inputs
+    if pipeline_token_ids.shape[0] < 2:
+        repeat = 2 // pipeline_token_ids.shape[0]
+        pipeline_token_ids = pipeline_token_ids.repeat(repeat, 1)
+        pipeline_img_ids = pipeline_img_ids.repeat(repeat)
+        pipeline_text_ids = pipeline_text_ids.repeat(repeat)
+        pipeline_box_embeddings = pipeline_box_embeddings.repeat(1, repeat, 1)
+        pipeline_box_mask = pipeline_box_mask.repeat(repeat, 1)
+        pipeline_box_labels = pipeline_box_labels.repeat(1, repeat)
+    pipeline_inputs = (
+        pipeline_images,
+        pipeline_token_ids,
+        pipeline_img_ids,
+        pipeline_text_ids,
+        pipeline_box_embeddings,
+        pipeline_box_mask,
+        pipeline_box_labels,
+    )
+
+    def pipeline_fn():
+        pipeline_module(*pipeline_inputs)
+
+    with torch.inference_mode():
+        cached_image_out = image_fn()
+        cached_text_out = text_fn()
+        decoder_only_inputs = _make_decoder_only_inputs_from_model(
+            model,
+            cached_image_out[2],
+            cached_image_out[1],
+            cached_text_out[1],
+            cached_text_out[0],
+            inputs,
+        )
+    (
+        decoder_backbone_fpn,
+        decoder_img_ids,
+        decoder_memory,
+        decoder_pos_embed,
+        decoder_prompt,
+        decoder_prompt_mask,
+        decoder_level_start_index,
+        decoder_spatial_shapes,
+        decoder_valid_ratios,
+    ) = decoder_only_inputs
+    if decoder_img_ids.shape[0] < 2:
+        repeat = 2 // decoder_img_ids.shape[0]
+        decoder_img_ids = decoder_img_ids.repeat(repeat)
+        decoder_memory = decoder_memory.repeat(1, repeat, 1)
+        decoder_pos_embed = decoder_pos_embed.repeat(1, repeat, 1)
+        decoder_prompt = decoder_prompt.repeat(1, repeat, 1)
+        decoder_prompt_mask = decoder_prompt_mask.repeat(repeat, 1)
+        decoder_valid_ratios = decoder_valid_ratios.repeat(repeat, 1, 1)
+        decoder_backbone_fpn = [
+            feat.repeat(repeat, 1, 1, 1) for feat in decoder_backbone_fpn
+        ]
+    decoder_only_inputs = (
+        decoder_backbone_fpn,
+        decoder_img_ids,
+        decoder_memory,
+        decoder_pos_embed,
+        decoder_prompt,
+        decoder_prompt_mask,
+        decoder_level_start_index,
+        decoder_spatial_shapes,
+        decoder_valid_ratios,
+    )
+
+    def decoder_only_fn():
+        decoder_module(*decoder_only_inputs)
+
+    with torch.inference_mode():
+        for _ in range(args.warmup):
+            pipeline_fn()
+        image_ms = _timeit(image_fn, args.iters, device) * 1000
+        text_ms = _timeit(text_fn, args.iters, device) * 1000
+        encoder_ms = _timeit(encoder_fn, args.iters, device) * 1000
+        pipeline_ms = _timeit(pipeline_fn, args.iters, device) * 1000
+        decoder_only_ms = _timeit(decoder_only_fn, args.iters, device) * 1000
 
     print("Eager total (ms):", round(eager_ms, 2))
+    print("Export full pipeline total (ms):", round(pipeline_ms, 2))
     print("Export image encoder (ms):", round(image_ms, 2))
     print("Export text encoder (ms):", round(text_ms, 2))
     print("Export encoder fusion (ms):", round(encoder_ms, 2))
-    print("Export decoder (ms):", round(decoder_ms, 2))
+    print("Export decoder only (ms):", round(decoder_only_ms, 2))
+    del model
 
 
 if __name__ == "__main__":

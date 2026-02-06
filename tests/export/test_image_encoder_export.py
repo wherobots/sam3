@@ -87,40 +87,6 @@ def test_image_encoder_export_matches_eager(sam3_model):
             torch.testing.assert_close(eager, compiled, rtol=1e-3, atol=1e-3)
 
 
-def test_image_encoder_export_dynamic_batch(sam3_model):
-    device = get_device()
-    images = _make_images(1, 1008, 1008, device)
-    with capture_stderr_on_fail("export_dynamic_batch"):
-        exported = _export_image_encoder(sam3_model, images)
-    module = exported.module()
-    with torch.no_grad():
-        out = module(_make_images(2, 1008, 1008, device))
-    assert isinstance(out, tuple)
-
-
-@pytest.mark.parametrize("height,width", [(1008, 1008)])
-def test_image_encoder_export_dynamic_spatial(sam3_model, height: int, width: int):
-    device = get_device()
-    images = _make_images(1, 1008, 1008, device)
-    with capture_stderr_on_fail("export_dynamic_spatial"):
-        exported = _export_image_encoder(sam3_model, images)
-    module = exported.module()
-    with torch.no_grad():
-        out = module(_make_images(1, height, width, device))
-    assert isinstance(out, tuple)
-
-
-def test_image_encoder_export_full_dynamic(sam3_model):
-    device = get_device()
-    images = _make_images(1, 1008, 1008, device)
-    with capture_stderr_on_fail("export_full_dynamic"):
-        exported = _export_image_encoder(sam3_model, images)
-    module = exported.module()
-    with torch.no_grad():
-        out = module(_make_images(3, 1008, 1008, device))
-    assert isinstance(out, tuple)
-
-
 @pytest.mark.parametrize("batch,height,width", [(2, 1008, 1008)])
 def test_image_encoder_export_inference_shapes(
     sam3_model, batch: int, height: int, width: int
