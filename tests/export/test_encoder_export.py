@@ -99,6 +99,7 @@ def _export_encoder(model: torch.nn.Module, img_feats, img_pos, prompt, prompt_m
     return exported
 
 
+@pytest.mark.slow
 def test_encoder_export_static(sam3_model):
     device = get_device()
     img_feats, img_pos, img_mask = _make_image_tokens(1, 72, 72, device)
@@ -108,6 +109,7 @@ def test_encoder_export_static(sam3_model):
     assert exported is not None
 
 
+@pytest.mark.slow
 def test_encoder_export_loads(sam3_model):
     device = get_device()
     img_feats, img_pos, img_mask = _make_image_tokens(1, 72, 72, device)
@@ -121,6 +123,7 @@ def test_encoder_export_loads(sam3_model):
     assert len(out) == 6
 
 
+@pytest.mark.slow
 def test_encoder_export_matches_eager(sam3_model):
     device = get_device()
     img_feats, img_pos, img_mask = _make_image_tokens(1, 72, 72, device)
@@ -137,6 +140,7 @@ def test_encoder_export_matches_eager(sam3_model):
         torch.testing.assert_close(eager, compiled, rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("batch,seq_len", [(1, 4), (2, 8)])
 def test_encoder_export_inference_shapes(sam3_model, batch: int, seq_len: int):
     device = get_device()

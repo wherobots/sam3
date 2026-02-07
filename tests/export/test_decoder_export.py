@@ -304,6 +304,7 @@ def _export_decoder_only(model: Any, inputs):
     return exported
 
 
+@pytest.mark.slow
 def test_decoder_export_static(sam3_model):
     device = get_device()
     inputs = _make_inputs(1, 1008, 1008, device, num_boxes=1)
@@ -312,6 +313,7 @@ def test_decoder_export_static(sam3_model):
     assert exported is not None
 
 
+@pytest.mark.slow
 def test_decoder_export_loads(sam3_model):
     device = get_device()
     inputs = _make_inputs(1, 1008, 1008, device, num_boxes=1)
@@ -324,6 +326,7 @@ def test_decoder_export_loads(sam3_model):
     assert len(out) == 4
 
 
+@pytest.mark.slow
 def test_decoder_export_matches_eager(sam3_model):
     device = get_device()
     inputs = _make_inputs(1, 1008, 1008, device, num_boxes=1)
@@ -342,6 +345,7 @@ def test_decoder_export_matches_eager(sam3_model):
             torch.testing.assert_close(eager, compiled, rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("batch", [1, 2])
 def test_full_sam3_pipeline_export_inference_shapes(sam3_model, batch: int):
     device = get_device()
@@ -355,6 +359,7 @@ def test_full_sam3_pipeline_export_inference_shapes(sam3_model, batch: int):
     assert isinstance(out, tuple)
 
 
+@pytest.mark.slow
 def test_decoder_only_export_loads(sam3_model):
     device = get_device()
     inputs = _make_inputs(1, 1008, 1008, device, num_boxes=1)
@@ -368,6 +373,7 @@ def test_decoder_only_export_loads(sam3_model):
     assert len(out) == 4
 
 
+@pytest.mark.slow
 def test_decoder_only_export_matches_eager(sam3_model):
     device = get_device()
     inputs = _make_inputs(1, 1008, 1008, device, num_boxes=1)

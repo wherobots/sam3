@@ -132,6 +132,7 @@ weights/
 checkpoints/
 sam3_logs/
 artifacts/
+tests/export/export_logs/
 
 # Data files
 *.h5

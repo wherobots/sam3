@@ -55,6 +55,7 @@ def _export_text_encoder(model: Any, token_ids: torch.Tensor):
     return exported
 
 
+@pytest.mark.slow
 def test_text_encoder_export_static(sam3_model):
     device = get_device()
     vocab_size = sam3_model.backbone.language_backbone.encoder.vocab_size
@@ -64,6 +65,7 @@ def test_text_encoder_export_static(sam3_model):
     assert exported is not None
 
 
+@pytest.mark.slow
 def test_text_encoder_export_loads(sam3_model):
     device = get_device()
     vocab_size = sam3_model.backbone.language_backbone.encoder.vocab_size
@@ -77,6 +79,7 @@ def test_text_encoder_export_loads(sam3_model):
     assert len(out) == 2
 
 
+@pytest.mark.slow
 def test_text_encoder_export_matches_eager(sam3_model):
     device = get_device()
     vocab_size = sam3_model.backbone.language_backbone.encoder.vocab_size
@@ -94,6 +97,7 @@ def test_text_encoder_export_matches_eager(sam3_model):
     torch.testing.assert_close(eager_out[1], export_out[1], rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("batch,seq_len", [(1, 32), (2, 32)])
 def test_text_encoder_export_inference_shapes(sam3_model, batch: int, seq_len: int):
     device = get_device()
