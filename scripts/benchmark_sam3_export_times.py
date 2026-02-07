@@ -123,10 +123,6 @@ def main() -> None:
             raise RuntimeError(
                 "encoder_fusion export currently expects num_feature_levels=1"
             )
-        if args.num_feature_levels != 1:
-            raise RuntimeError(
-                "encoder_fusion export currently expects num_feature_levels=1"
-            )
         torch.export.export(
             encoder_wrapper,
             (img_feats, img_pos, img_mask, text_memory, text_attention_mask),
