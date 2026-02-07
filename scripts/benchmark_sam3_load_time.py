@@ -23,6 +23,12 @@ def main() -> None:
         type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
     )
+    parser.add_argument(
+        "--num-feature-levels",
+        type=int,
+        default=1,
+        help="Unused; kept for parity with other benchmarks",
+    )
     args = parser.parse_args()
 
     if args.device.startswith("cuda"):

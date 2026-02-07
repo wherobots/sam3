@@ -9,6 +9,8 @@ from PIL import Image
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
+from typing import Any, cast
+
 from sam3.model_builder import build_sam3_image_model
 from sam3.model.data_misc import FindStage
 from sam3.model.geometry_encoders import Prompt
@@ -29,7 +31,7 @@ class FullSam3PipelineWrapper(torch.nn.Module):
         box_mask: torch.Tensor,
         box_labels: torch.Tensor,
     ):
-        model = self.model
+        model = cast(Any, self.model)
         backbone_out = model.backbone.forward_image(images)
         text_encoder = model.backbone.language_backbone
         _, text_tokens = text_encoder.encoder(token_ids)
@@ -130,6 +132,12 @@ def main() -> None:
         default="cuda" if torch.cuda.is_available() else "cpu",
     )
     parser.add_argument(
+        "--num-feature-levels",
+        type=int,
+        default=1,
+        help="Number of feature levels to use",
+    )
+    parser.add_argument(
         "--out-dir",
         type=Path,
         default=Path("artifacts/export"),
@@ -142,7 +150,10 @@ def main() -> None:
         raise ValueError("Provide at least one prompt")
 
     model = build_sam3_image_model(
-        device=args.device, eval_mode=True, enable_segmentation=True
+        device=args.device,
+        eval_mode=True,
+        enable_segmentation=True,
+        num_feature_levels=args.num_feature_levels,
     )
     model.eval()
 

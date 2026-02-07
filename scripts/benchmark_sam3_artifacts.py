@@ -205,6 +205,12 @@ def main() -> None:
         default=Path("artifacts/export"),
         help="Directory with exported artifacts",
     )
+    parser.add_argument(
+        "--num-feature-levels",
+        type=int,
+        default=1,
+        help="Number of feature levels to use",
+    )
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iters", type=int, default=10)
     args = parser.parse_args()
@@ -214,7 +220,10 @@ def main() -> None:
         raise ValueError("Provide at least one prompt")
 
     model = build_sam3_image_model(
-        device=args.device, eval_mode=True, enable_segmentation=True
+        device=args.device,
+        eval_mode=True,
+        enable_segmentation=True,
+        num_feature_levels=args.num_feature_levels,
     )
     model.eval()
 

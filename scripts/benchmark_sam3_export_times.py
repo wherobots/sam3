@@ -59,17 +59,28 @@ def main() -> None:
         type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
     )
+    parser.add_argument(
+        "--num-feature-levels",
+        type=int,
+        default=1,
+        help="Number of feature levels to use",
+    )
     args = parser.parse_args()
 
     device = torch.device(args.device)
     model = build_sam3_image_model(
-        device=args.device, eval_mode=True, enable_segmentation=True
+        device=args.device,
+        eval_mode=True,
+        enable_segmentation=True,
+        num_feature_levels=args.num_feature_levels,
     )
     model.eval()
 
     image = _prepare_image(_load_image(args.image, device), size=1008)
     inputs = _make_inputs(1, 1008, 1008, str(device), num_boxes=1)
 
+    decoder_inputs = None
+    decoder_inputs_error = None
     with torch.no_grad():
         backbone_out = model.backbone.forward_image(image)
         text_encoder = model.backbone.language_backbone
@@ -93,7 +104,10 @@ def main() -> None:
             device=img_feats.device,
             dtype=torch.bool,
         )
-        decoder_inputs = _make_decoder_only_inputs(model, inputs)
+        try:
+            decoder_inputs = _make_decoder_only_inputs(model, inputs)
+        except Exception as exc:
+            decoder_inputs_error = exc
 
     def export_image_encoder():
         _export_image_encoder(model, image)
@@ -105,6 +119,14 @@ def main() -> None:
         encoder_wrapper = (
             EncoderFusionWrapper(model.transformer.encoder).to(img_feats.device).eval()
         )
+        if args.num_feature_levels != 1:
+            raise RuntimeError(
+                "encoder_fusion export currently expects num_feature_levels=1"
+            )
+        if args.num_feature_levels != 1:
+            raise RuntimeError(
+                "encoder_fusion export currently expects num_feature_levels=1"
+            )
         torch.export.export(
             encoder_wrapper,
             (img_feats, img_pos, img_mask, text_memory, text_attention_mask),
@@ -129,14 +151,25 @@ def main() -> None:
         _export_full_sam3_pipeline(model, inputs)
 
     def export_decoder_only():
+        if decoder_inputs_error is not None:
+            raise decoder_inputs_error
         _export_decoder_only(model, decoder_inputs)
 
     with torch.no_grad():
         _time("Export image encoder", export_image_encoder)
         _time("Export text encoder", export_text_encoder)
-        _time("Export encoder fusion", export_encoder_fusion)
-        _time("Export full pipeline", export_full_pipeline)
-        _time("Export decoder only", export_decoder_only)
+        if args.num_feature_levels == 1:
+            _time("Export encoder fusion", export_encoder_fusion)
+        else:
+            print("Export encoder fusion: skipped (num_feature_levels != 1)")
+        try:
+            _time("Export full pipeline", export_full_pipeline)
+        except Exception as exc:
+            print(f"Export full pipeline: failed ({type(exc).__name__}: {exc})")
+        try:
+            _time("Export decoder only", export_decoder_only)
+        except Exception as exc:
+            print(f"Export decoder only: failed ({type(exc).__name__}: {exc})")
 
 
 if __name__ == "__main__":

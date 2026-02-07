@@ -124,12 +124,14 @@ dmypy.json
 # Model weights and checkpoints
 *.pth
 *.pt
+*.pt2
 *.bin
 *.ckpt
 *.safetensors
 weights/
 checkpoints/
 sam3_logs/
+artifacts/
 
 # Data files
 *.h5
