@@ -155,66 +155,51 @@ def _export_full_sam3_pipeline(model: Any, inputs):
     ) = inputs
     device = images.device
     wrapper = FullSam3PipelineWrapper(model).to(device).eval()  # type: ignore[arg-type]
-
-    def _export_with_min_batch(min_batch: int):
-        local_images = images
-        local_token_ids = token_ids
-        local_img_ids = img_ids
-        local_text_ids = text_ids
-        local_box_embeddings = box_embeddings
-        local_box_mask = box_mask
-        local_box_labels = box_labels
-        if local_images.shape[0] < min_batch:
-            repeat = min_batch // local_images.shape[0]
-            local_images = local_images.repeat(repeat, 1, 1, 1)
-            local_token_ids = local_token_ids.repeat(repeat, 1)
-            local_img_ids = local_img_ids.repeat(repeat)
-            local_text_ids = local_text_ids.repeat(repeat)
-            local_box_embeddings = local_box_embeddings.repeat(1, repeat, 1)
-            local_box_mask = local_box_mask.repeat(repeat, 1)
-            local_box_labels = local_box_labels.repeat(1, repeat)
-        with torch.no_grad():
-            return torch.export.export(
-                wrapper,
-                (
-                    local_images,
-                    local_token_ids,
-                    local_img_ids,
-                    local_text_ids,
-                    local_box_embeddings,
-                    local_box_mask,
-                    local_box_labels,
-                ),
-                dynamic_shapes={
-                    "images": {
-                        0: torch.export.Dim.AUTO,
-                        2: 1008,
-                        3: 1008,
-                    },
-                    "token_ids": {
-                        0: torch.export.Dim.AUTO,
-                        1: 32,
-                    },
-                    "img_ids": {0: torch.export.Dim.AUTO},
-                    "text_ids": {0: torch.export.Dim.AUTO},
-                    "box_embeddings": {
-                        0: 1,
-                        1: torch.export.Dim.AUTO,
-                    },
-                    "box_mask": {
-                        0: torch.export.Dim.AUTO,
-                        1: 1,
-                    },
-                    "box_labels": {
-                        0: 1,
-                        1: torch.export.Dim.AUTO,
-                    },
+    if images.shape[0] < 2:
+        repeat = 2 // images.shape[0]
+        export_inputs = (
+            images.repeat(repeat, 1, 1, 1),
+            token_ids.repeat(repeat, 1),
+            img_ids.repeat(repeat),
+            text_ids.repeat(repeat),
+            box_embeddings.repeat(1, repeat, 1),
+            box_mask.repeat(repeat, 1),
+            box_labels.repeat(1, repeat),
+        )
+    else:
+        export_inputs = inputs
+    with torch.no_grad():
+        return torch.export.export(
+            wrapper,
+            export_inputs,
+            dynamic_shapes={
+                "images": {
+                    0: torch.export.Dim.AUTO,
+                    2: 1008,
+                    3: 1008,
                 },
-                strict=False,
-                prefer_deferred_runtime_asserts_over_guards=True,
-            )
-
-    return _export_with_min_batch(2)
+                "token_ids": {
+                    0: torch.export.Dim.AUTO,
+                    1: 32,
+                },
+                "img_ids": {0: torch.export.Dim.AUTO},
+                "text_ids": {0: torch.export.Dim.AUTO},
+                "box_embeddings": {
+                    0: 1,
+                    1: torch.export.Dim.AUTO,
+                },
+                "box_mask": {
+                    0: torch.export.Dim.AUTO,
+                    1: 1,
+                },
+                "box_labels": {
+                    0: 1,
+                    1: torch.export.Dim.AUTO,
+                },
+            },
+            strict=False,
+            prefer_deferred_runtime_asserts_over_guards=True,
+        )
 
 
 class DecoderOnlyWrapper(torch.nn.Module):
