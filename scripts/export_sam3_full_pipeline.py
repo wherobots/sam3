@@ -25,13 +25,22 @@ class FullSam3PipelineWrapper(torch.nn.Module):
         self,
         images: torch.Tensor,
         token_ids: torch.Tensor,
-        img_ids: torch.Tensor,
-        text_ids: torch.Tensor,
-        box_embeddings: torch.Tensor,
-        box_mask: torch.Tensor,
-        box_labels: torch.Tensor,
     ):
         model = cast(Any, self.model)
+        num_images = images.shape[0]
+        num_prompts = token_ids.shape[0]
+        device = images.device
+        bs = num_images * num_prompts
+
+        img_ids = torch.arange(num_images, device=device, dtype=torch.long)
+        img_ids = img_ids.repeat_interleave(num_prompts)
+        text_ids = torch.arange(num_prompts, device=device, dtype=torch.long)
+        text_ids = text_ids.repeat(num_images)
+
+        box_embeddings = torch.zeros(1, bs, 4, device=device)
+        box_mask = torch.zeros(bs, 1, device=device, dtype=torch.bool)
+        box_labels = torch.zeros(1, bs, device=device, dtype=torch.long)
+
         backbone_out = model.backbone.forward_image(images)
         text_encoder = model.backbone.language_backbone
         _, text_tokens = text_encoder.encoder(token_ids)
@@ -48,12 +57,8 @@ class FullSam3PipelineWrapper(torch.nn.Module):
             input_boxes=box_embeddings,
             input_boxes_mask=box_mask,
             input_boxes_label=box_labels,
-            input_points=torch.zeros(
-                0, int(token_ids.shape[0]), 2, device=images.device
-            ),
-            input_points_mask=torch.zeros(
-                int(token_ids.shape[0]), 0, device=images.device, dtype=torch.bool
-            ),
+            input_points=torch.zeros(0, bs, 2, device=device),
+            input_points_mask=torch.zeros(bs, 0, device=device, dtype=torch.bool),
         )
         geometric_prompt = Prompt(
             box_embeddings=box_embeddings,
@@ -92,23 +97,10 @@ def _prepare_image(image: torch.Tensor, size: int) -> torch.Tensor:
 
 def _make_inputs(model, image: torch.Tensor, prompts):
     device = image.device
-    num_prompts = len(prompts)
-    num_images = int(image.shape[0])
-    token_ids = model.backbone.language_backbone.tokenizer(
-        prompts, context_length=32
-    ).to(device)
-    img_ids = torch.arange(num_images, device=device, dtype=torch.long)
-    img_ids = img_ids.repeat_interleave(num_prompts)
-    text_ids = torch.arange(num_prompts, device=device, dtype=torch.long)
-    text_ids = text_ids.repeat(num_images)
+    token_ids = model.backbone.language_backbone.tokenizer(prompts, context_length=32).to(device)
     return (
         image,
         token_ids,
-        img_ids,
-        text_ids,
-        torch.zeros(1, num_prompts, 4, device=device),
-        torch.zeros(num_prompts, 1, device=device, dtype=torch.bool),
-        torch.zeros(1, num_prompts, device=device, dtype=torch.long),
     )
 
 
@@ -157,9 +149,7 @@ def main() -> None:
     )
     model.eval()
 
-    image = _prepare_image(
-        _load_image(args.image, torch.device(args.device)), size=1008
-    )
+    image = _prepare_image(_load_image(args.image, torch.device(args.device)), size=1008)
     inputs = _make_inputs(model, image, prompts)
     wrapper = FullSam3PipelineWrapper(model).to(image.device).eval()
     if image.shape[0] < 2:
@@ -167,11 +157,6 @@ def main() -> None:
         export_inputs = (
             image.repeat(repeat, 1, 1, 1),
             inputs[1].repeat(repeat, 1),
-            inputs[2].repeat(repeat),
-            inputs[3].repeat(repeat),
-            inputs[4].repeat(1, repeat, 1),
-            inputs[5].repeat(repeat, 1),
-            inputs[6].repeat(1, repeat),
         )
     else:
         export_inputs = inputs
@@ -186,22 +171,8 @@ def main() -> None:
                     3: 1008,
                 },
                 "token_ids": {
-                    0: torch.export.Dim.AUTO,
+                    0: torch.export.Dim("num_prompts", min=1),
                     1: 32,
-                },
-                "img_ids": {0: torch.export.Dim.AUTO},
-                "text_ids": {0: torch.export.Dim.AUTO},
-                "box_embeddings": {
-                    0: 1,
-                    1: torch.export.Dim.AUTO,
-                },
-                "box_mask": {
-                    0: torch.export.Dim.AUTO,
-                    1: 1,
-                },
-                "box_labels": {
-                    0: 1,
-                    1: torch.export.Dim.AUTO,
                 },
             },
             strict=False,

@@ -39,29 +39,13 @@ def _prepare_image(image: torch.Tensor, size: int) -> torch.Tensor:
 
 def _make_inputs(model, image: torch.Tensor, prompts):
     device = image.device
-    num_prompts = len(prompts)
-    num_images = int(image.shape[0])
 
     tokenizer = model.backbone.language_backbone.tokenizer
     token_ids = tokenizer(prompts, context_length=32).to(device)
 
-    img_ids = torch.arange(num_images, device=device, dtype=torch.long)
-    img_ids = img_ids.repeat_interleave(num_prompts)
-    text_ids = torch.arange(num_prompts, device=device, dtype=torch.long)
-    text_ids = text_ids.repeat(num_images)
-
-    box_embeddings = torch.zeros(1, num_prompts, 4, device=device)
-    box_mask = torch.zeros(num_prompts, 1, device=device, dtype=torch.bool)
-    box_labels = torch.zeros(1, num_prompts, device=device, dtype=torch.long)
-
     return (
         image,
         token_ids,
-        img_ids,
-        text_ids,
-        box_embeddings,
-        box_mask,
-        box_labels,
     )
 
 
@@ -101,9 +85,7 @@ def main() -> None:
     if not prompts:
         raise ValueError("Provide at least one prompt")
 
-    model = build_sam3_image_model(
-        device=args.device, eval_mode=True, enable_segmentation=True
-    )
+    model = build_sam3_image_model(device=args.device, eval_mode=True, enable_segmentation=True)
     model.eval()
 
     image = _load_image(args.image, torch.device(args.device))
@@ -139,9 +121,7 @@ def main() -> None:
         img_pos = img_pos.repeat(prompt_batch, 1, 1, 1)
         img_mask = img_mask.repeat(prompt_batch, 1, 1)
 
-    encoder_wrapper = (
-        EncoderFusionWrapper(model.transformer.encoder).to(img_feats.device).eval()
-    )
+    encoder_wrapper = EncoderFusionWrapper(model.transformer.encoder).to(img_feats.device).eval()
     encoder = torch.export.export(
         encoder_wrapper,
         (img_feats, img_pos, img_mask, prompt, prompt_mask),

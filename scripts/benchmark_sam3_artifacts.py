@@ -34,42 +34,31 @@ def _prepare_image(image: torch.Tensor, size: int) -> torch.Tensor:
 
 def _make_inputs(model, image: torch.Tensor, prompts):
     device = image.device
-    num_prompts = len(prompts)
-    num_images = int(image.shape[0])
 
     tokenizer = model.backbone.language_backbone.tokenizer
     token_ids = tokenizer(prompts, context_length=32).to(device)
+
+    return (
+        image,
+        token_ids,
+    )
+
+
+def _run_full_model(model, inputs):
+    images, token_ids = inputs
+    num_images = images.shape[0]
+    num_prompts = token_ids.shape[0]
+    device = images.device
+    bs = num_images * num_prompts
 
     img_ids = torch.arange(num_images, device=device, dtype=torch.long)
     img_ids = img_ids.repeat_interleave(num_prompts)
     text_ids = torch.arange(num_prompts, device=device, dtype=torch.long)
     text_ids = text_ids.repeat(num_images)
 
-    box_embeddings = torch.zeros(1, num_prompts, 4, device=device)
-    box_mask = torch.zeros(num_prompts, 1, device=device, dtype=torch.bool)
-    box_labels = torch.zeros(1, num_prompts, device=device, dtype=torch.long)
-
-    return (
-        image,
-        token_ids,
-        img_ids,
-        text_ids,
-        box_embeddings,
-        box_mask,
-        box_labels,
-    )
-
-
-def _run_full_model(model, inputs):
-    (
-        images,
-        token_ids,
-        img_ids,
-        text_ids,
-        box_embeddings,
-        box_mask,
-        box_labels,
-    ) = inputs
+    box_embeddings = torch.zeros(1, bs, 4, device=device)
+    box_mask = torch.zeros(bs, 1, device=device, dtype=torch.bool)
+    box_labels = torch.zeros(1, bs, device=device, dtype=torch.long)
     backbone_out = model.backbone.forward_image(images)
     text_encoder = model.backbone.language_backbone
     _, text_tokens = text_encoder.encoder(token_ids)
@@ -113,15 +102,20 @@ def _make_decoder_only_inputs_from_model(
     text_attention_mask,
     inputs,
 ):
-    (
-        images,
-        token_ids,
-        img_ids,
-        text_ids,
-        box_embeddings,
-        box_mask,
-        box_labels,
-    ) = inputs
+    images, token_ids = inputs
+    num_images = images.shape[0]
+    num_prompts = token_ids.shape[0]
+    device = images.device
+    bs = num_images * num_prompts
+
+    img_ids = torch.arange(num_images, device=device, dtype=torch.long)
+    img_ids = img_ids.repeat_interleave(num_prompts)
+    text_ids = torch.arange(num_prompts, device=device, dtype=torch.long)
+    text_ids = text_ids.repeat(num_images)
+
+    box_embeddings = torch.zeros(1, bs, 4, device=device)
+    box_mask = torch.zeros(bs, 1, device=device, dtype=torch.bool)
+    box_labels = torch.zeros(1, bs, device=device, dtype=torch.long)
     backbone_out = {
         "backbone_fpn": backbone_fpn,
         "vision_pos_enc": vision_pos_enc,
@@ -147,9 +141,7 @@ def _make_decoder_only_inputs_from_model(
     prompt, prompt_mask, backbone_out = model._encode_prompt(
         backbone_out, find_input, geometric_prompt
     )
-    backbone_out, encoder_out, _ = model._run_encoder(
-        backbone_out, find_input, prompt, prompt_mask
-    )
+    backbone_out, encoder_out, _ = model._run_encoder(backbone_out, find_input, prompt, prompt_mask)
     return (
         backbone_out["backbone_fpn"],
         img_ids,
@@ -286,32 +278,7 @@ def main() -> None:
     def encoder_fn():
         encoder_from_outputs(cached_image_out, cached_text_out)
 
-    (
-        pipeline_images,
-        pipeline_token_ids,
-        pipeline_img_ids,
-        pipeline_text_ids,
-        pipeline_box_embeddings,
-        pipeline_box_mask,
-        pipeline_box_labels,
-    ) = inputs
-    if pipeline_token_ids.shape[0] < 2:
-        repeat = 2 // pipeline_token_ids.shape[0]
-        pipeline_token_ids = pipeline_token_ids.repeat(repeat, 1)
-        pipeline_img_ids = pipeline_img_ids.repeat(repeat)
-        pipeline_text_ids = pipeline_text_ids.repeat(repeat)
-        pipeline_box_embeddings = pipeline_box_embeddings.repeat(1, repeat, 1)
-        pipeline_box_mask = pipeline_box_mask.repeat(repeat, 1)
-        pipeline_box_labels = pipeline_box_labels.repeat(1, repeat)
-    pipeline_inputs = (
-        pipeline_images,
-        pipeline_token_ids,
-        pipeline_img_ids,
-        pipeline_text_ids,
-        pipeline_box_embeddings,
-        pipeline_box_mask,
-        pipeline_box_labels,
-    )
+    pipeline_inputs = inputs
 
     def pipeline_fn():
         pipeline_module(*pipeline_inputs)
@@ -346,9 +313,7 @@ def main() -> None:
         decoder_prompt = decoder_prompt.repeat(1, repeat, 1)
         decoder_prompt_mask = decoder_prompt_mask.repeat(repeat, 1)
         decoder_valid_ratios = decoder_valid_ratios.repeat(repeat, 1, 1)
-        decoder_backbone_fpn = [
-            feat.repeat(repeat, 1, 1, 1) for feat in decoder_backbone_fpn
-        ]
+        decoder_backbone_fpn = [feat.repeat(repeat, 1, 1, 1) for feat in decoder_backbone_fpn]
     decoder_only_inputs = (
         decoder_backbone_fpn,
         decoder_img_ids,
