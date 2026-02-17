@@ -41,3 +41,27 @@ def get_device() -> str:
     if device is None:
         device = "cuda" if torch.cuda.is_available() and not force_cpu else "cpu"
     return device
+
+
+def save_output_shapes(
+    suffix: str,
+    inputs: tuple[torch.Tensor, ...] | None,
+    outputs: tuple[torch.Tensor | None, ...],
+) -> None:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    lines: list[str] = []
+    if inputs is not None:
+        for idx, value in enumerate(inputs):
+            lines.append(
+                f"input[{idx}] shape={tuple(value.shape)} dtype={value.dtype} device={value.device}"
+            )
+    for idx, value in enumerate(outputs):
+        if value is None:
+            lines.append(f"output[{idx}] None")
+        else:
+            lines.append(
+                f"output[{idx}] shape={tuple(value.shape)} dtype={value.dtype} device={value.device}"
+            )
+    log_path = LOG_DIR / f"{_current_test_name()}-{suffix}.shapes.txt"
+    with log_path.open("w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines))

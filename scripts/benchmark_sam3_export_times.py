@@ -77,7 +77,7 @@ def main() -> None:
     model.eval()
 
     image = _prepare_image(_load_image(args.image, device), size=1008)
-    inputs = _make_inputs(1, 1008, 1008, str(device), num_boxes=1)
+    inputs = _make_inputs(1, 1008, 1008, str(device))
 
     decoder_inputs = None
     decoder_inputs_error = None
@@ -120,9 +120,7 @@ def main() -> None:
             EncoderFusionWrapper(model.transformer.encoder).to(img_feats.device).eval()
         )
         if args.num_feature_levels != 1:
-            raise RuntimeError(
-                "encoder_fusion export currently expects num_feature_levels=1"
-            )
+            raise RuntimeError("encoder_fusion export currently expects num_feature_levels=1")
         torch.export.export(
             encoder_wrapper,
             (img_feats, img_pos, img_mask, text_memory, text_attention_mask),

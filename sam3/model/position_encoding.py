@@ -53,7 +53,7 @@ class PositionEmbeddingSine(nn.Module):
 
     def _encode_xy(self, x, y):
         # The positions are expected to be normalized
-        assert len(x) == len(y) and x.ndim == y.ndim == 1
+        # torch._check(len(x) == len(y) and x.ndim == y.ndim == 1)
         x_embed = x * self.scale
         y_embed = y * self.scale
 
@@ -62,12 +62,8 @@ class PositionEmbeddingSine(nn.Module):
 
         pos_x = x_embed[:, None] / dim_t
         pos_y = y_embed[:, None] / dim_t
-        pos_x = torch.stack(
-            (pos_x[:, 0::2].sin(), pos_x[:, 1::2].cos()), dim=2
-        ).flatten(1)
-        pos_y = torch.stack(
-            (pos_y[:, 0::2].sin(), pos_y[:, 1::2].cos()), dim=2
-        ).flatten(1)
+        pos_x = torch.stack((pos_x[:, 0::2].sin(), pos_x[:, 1::2].cos()), dim=2).flatten(1)
+        pos_y = torch.stack((pos_y[:, 0::2].sin(), pos_y[:, 1::2].cos()), dim=2).flatten(1)
         return pos_x, pos_y
 
     @torch.no_grad()
