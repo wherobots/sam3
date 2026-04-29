@@ -115,13 +115,16 @@ def export_full_pipeline(
     token_ids = torch.zeros(num_export_prompts, CONTEXT_LENGTH, dtype=torch.long, device=device)
     token_ids[:, 0] = 49406  # <|startoftext|> so attention mask is non-empty
 
+    # Named Dim with min=1 so consumers can call with batch=1; Dim.AUTO would
+    # take its min from the example shape (2) and refuse batch=1 at runtime.
+    batch = Dim("batch", min=1)
     num_prompts = Dim("num_prompts", min=1)
     with torch.no_grad():
         return torch.export.export(
             wrapper,
             (images, token_ids),
             dynamic_shapes={
-                "images": {0: Dim.AUTO, 2: INPUT_SIZE, 3: INPUT_SIZE},
+                "images": {0: batch, 2: INPUT_SIZE, 3: INPUT_SIZE},
                 "token_ids": {0: num_prompts, 1: CONTEXT_LENGTH},
             },
             strict=False,
