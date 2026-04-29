@@ -67,6 +67,27 @@ def test_full_pipeline_export_matches_eager(sam3_model: torch.nn.Module) -> None
 
 
 @pytest.mark.slow
+def test_full_pipeline_export_save_load_roundtrip(
+    sam3_model: torch.nn.Module, tmp_path
+) -> None:
+    """Save the export to a .pt2, reload, and confirm it still runs."""
+    import torchvision.ops  # noqa: F401  -- registers roi_align before load
+
+    device = _device()
+    ep = export_full_pipeline(sam3_model, device=device, num_export_prompts=3)
+    out_path = tmp_path / "full_sam3_pipeline.pt2"
+    torch.export.save(ep, str(out_path))
+
+    loaded = torch.export.load(str(out_path))
+    images = torch.randn(2, 3, INPUT_SIZE, INPUT_SIZE, device=device)
+    token_ids = torch.zeros(3, CONTEXT_LENGTH, dtype=torch.long, device=device)
+    token_ids[:, 0] = 49406
+    with torch.no_grad():
+        out = loaded.module()(images, token_ids)
+    assert out[0].shape[0] == images.shape[0] * token_ids.shape[0]
+
+
+@pytest.mark.slow
 @pytest.mark.parametrize(("batch", "num_prompts"), [(1, 1), (1, 2), (3, 2), (2, 4)])
 def test_full_pipeline_export_supports_dynamic_shapes(
     sam3_model: torch.nn.Module, batch: int, num_prompts: int
