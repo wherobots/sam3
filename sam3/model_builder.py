@@ -122,7 +122,10 @@ def _create_vl_backbone(vit_neck, text_encoder):
     return SAM3VLBackbone(visual=vit_neck, text=text_encoder, scalp=1)
 
 
-def _create_transformer_encoder(use_fa3=False) -> TransformerEncoderFusion:
+def _create_transformer_encoder(
+    use_fa3: bool = False,
+    num_feature_levels: int = 1,
+) -> TransformerEncoderFusion:
     """Create transformer encoder with its layer."""
     encoder_layer = TransformerEncoderLayer(
         activation="relu",
@@ -153,7 +156,7 @@ def _create_transformer_encoder(use_fa3=False) -> TransformerEncoderFusion:
         layer=encoder_layer,
         num_layers=6,
         d_model=256,
-        num_feature_levels=1,
+        num_feature_levels=num_feature_levels,
         frozen=False,
         use_act_checkpoint=True,
         add_pooled_text_to_img_feat=False,
@@ -307,6 +310,7 @@ def _create_sam3_model(
     dot_prod_scoring,
     inst_interactive_predictor,
     eval_mode,
+    num_feature_levels: int = 1,
 ):
     """Create the SAM3 image model."""
     common_params = {
@@ -314,7 +318,7 @@ def _create_sam3_model(
         "transformer": transformer,
         "input_geometry_encoder": input_geometry_encoder,
         "segmentation_head": segmentation_head,
-        "num_feature_levels": 1,
+        "num_feature_levels": num_feature_levels,
         "o2m_mask_predict": True,
         "dot_prod_scoring": dot_prod_scoring,
         "use_instance_query": False,
@@ -527,10 +531,14 @@ def _create_vision_backbone(
 
 
 def _create_sam3_transformer(
-    has_presence_token: bool = True, use_fa3: bool = False
+    has_presence_token: bool = True,
+    use_fa3: bool = False,
+    num_feature_levels: int = 1,
 ) -> TransformerWrapper:
     """Create SAM3 transformer encoder and decoder."""
-    encoder: TransformerEncoderFusion = _create_transformer_encoder(use_fa3=use_fa3)
+    encoder: TransformerEncoderFusion = _create_transformer_encoder(
+        use_fa3=use_fa3, num_feature_levels=num_feature_levels
+    )
     decoder: TransformerDecoder = _create_transformer_decoder(use_fa3=use_fa3)
 
     return TransformerWrapper(encoder=encoder, decoder=decoder, d_model=256)
@@ -579,6 +587,7 @@ def build_sam3_image_model(
     enable_segmentation=True,
     enable_inst_interactivity=False,
     compile=False,
+    num_feature_levels: int = 1,
 ):
     """
     Build SAM3 image model
@@ -613,7 +622,7 @@ def build_sam3_image_model(
     backbone = _create_vl_backbone(vision_encoder, text_encoder)
 
     # Create transformer components
-    transformer = _create_sam3_transformer()
+    transformer = _create_sam3_transformer(num_feature_levels=num_feature_levels)
 
     # Create dot product scoring
     dot_prod_scoring = _create_dot_product_scoring()
@@ -641,6 +650,7 @@ def build_sam3_image_model(
         dot_prod_scoring,
         inst_predictor,
         eval_mode,
+        num_feature_levels=num_feature_levels,
     )
     if load_from_HF and checkpoint_path is None:
         checkpoint_path = download_ckpt_from_hf(version="sam3")
@@ -706,7 +716,9 @@ def build_sam3_video_model(
     visual_neck = _create_vision_backbone()
     text_encoder = _create_text_encoder(bpe_path)
     backbone = SAM3VLBackbone(scalp=1, visual=visual_neck, text=text_encoder)
-    transformer = _create_sam3_transformer(has_presence_token=has_presence_token)
+    transformer = _create_sam3_transformer(
+        has_presence_token=has_presence_token, num_feature_levels=1
+    )
     segmentation_head: UniversalSegmentationHead = _create_segmentation_head()
     input_geometry_encoder = _create_geometry_encoder()
 

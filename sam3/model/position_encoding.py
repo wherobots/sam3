@@ -59,7 +59,7 @@ class PositionEmbeddingSine(nn.Module):
 
     def _encode_xy(self, x, y):
         # The positions are expected to be normalized
-        assert len(x) == len(y) and x.ndim == y.ndim == 1
+        # torch._check(len(x) == len(y) and x.ndim == y.ndim == 1)
         x_embed = x * self.scale
         y_embed = y * self.scale
 
@@ -68,12 +68,8 @@ class PositionEmbeddingSine(nn.Module):
 
         pos_x = x_embed[:, None] / dim_t
         pos_y = y_embed[:, None] / dim_t
-        pos_x = torch.stack(
-            (pos_x[:, 0::2].sin(), pos_x[:, 1::2].cos()), dim=2
-        ).flatten(1)
-        pos_y = torch.stack(
-            (pos_y[:, 0::2].sin(), pos_y[:, 1::2].cos()), dim=2
-        ).flatten(1)
+        pos_x = torch.stack((pos_x[:, 0::2].sin(), pos_x[:, 1::2].cos()), dim=2).flatten(1)
+        pos_y = torch.stack((pos_y[:, 0::2].sin(), pos_y[:, 1::2].cos()), dim=2).flatten(1)
         return pos_x, pos_y
 
     @torch.no_grad()
@@ -95,9 +91,9 @@ class PositionEmbeddingSine(nn.Module):
 
     @torch.no_grad()
     def forward(self, x):
-        cache_key = None
         cache_key = (x.shape[-2], x.shape[-1])
-        if cache_key in self.cache:
+        use_cache = all(isinstance(dim, int) for dim in cache_key)
+        if use_cache and cache_key in self.cache:
             return self.cache[cache_key][None].repeat(x.shape[0], 1, 1, 1)
         y_embed = (
             torch.arange(1, x.shape[-2] + 1, dtype=torch.float32, device=x.device)
@@ -127,6 +123,6 @@ class PositionEmbeddingSine(nn.Module):
             (pos_y[:, :, :, 0::2].sin(), pos_y[:, :, :, 1::2].cos()), dim=4
         ).flatten(3)
         pos = torch.cat((pos_y, pos_x), dim=3).permute(0, 3, 1, 2)
-        if cache_key is not None:
+        if use_cache:
             self.cache[cache_key] = pos[0]
         return pos

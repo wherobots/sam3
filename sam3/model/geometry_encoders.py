@@ -645,11 +645,28 @@ class SequenceGeometryEncoder(nn.Module):
             # We need to denormalize, and convert to [x, y, x, y]
             boxes_xyxy = box_cxcywh_to_xyxy(boxes)
             scale = torch.tensor([W, H, W, H], dtype=boxes_xyxy.dtype)
-            scale = scale.pin_memory().to(device=boxes_xyxy.device, non_blocking=True)
+            if (
+                torch.is_tensor(scale)
+                and scale.device.type == "cpu"
+                and boxes_xyxy.device.type != "cpu"
+                and not torch._dynamo.is_compiling()
+            ):
+                scale = scale.pin_memory()
+            scale = scale.to(
+                device=boxes_xyxy.device,
+                non_blocking=boxes_xyxy.device.type != "cpu" and not torch._dynamo.is_compiling(),
+            )
             scale = scale.view(1, 1, 4)
             boxes_xyxy = boxes_xyxy * scale
+            boxes_xyxy = boxes_xyxy.transpose(0, 1)
+            batch_idx = torch.arange(
+                bs, device=boxes_xyxy.device, dtype=boxes_xyxy.dtype
+            )
+            batch_idx = batch_idx.view(bs, 1, 1).expand(bs, n_boxes, 1)
+            boxes_for_roi = torch.cat([batch_idx, boxes_xyxy], dim=-1)
+            boxes_for_roi = boxes_for_roi.reshape(-1, 5)
             sampled = torchvision.ops.roi_align(
-                img_feats, boxes_xyxy.float().transpose(0, 1).unbind(0), self.roi_size
+                img_feats, boxes_for_roi.float(), self.roi_size
             )
             assert list(sampled.shape) == [
                 bs * n_boxes,
