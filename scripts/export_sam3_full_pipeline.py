@@ -110,7 +110,8 @@ def export_full_pipeline(
 
     wrapper = FullSam3PipelineWrapper(model).to(device).eval()
 
-    images = torch.randn(1, 3, INPUT_SIZE, INPUT_SIZE, device=device)
+    # Trace with batch=2 so Dim.AUTO doesn't specialize the batch dim away.
+    images = torch.randn(2, 3, INPUT_SIZE, INPUT_SIZE, device=device)
     token_ids = torch.zeros(num_export_prompts, CONTEXT_LENGTH, dtype=torch.long, device=device)
     token_ids[:, 0] = 49406  # <|startoftext|> so attention mask is non-empty
 
