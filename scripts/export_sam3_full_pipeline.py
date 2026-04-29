@@ -56,40 +56,52 @@ class FullSam3PipelineWrapper(torch.nn.Module):
         box_mask = torch.ones(bs, 1, device=device, dtype=torch.bool)
         box_labels = torch.zeros(1, bs, device=device, dtype=torch.long)
 
-        backbone_out = model.backbone.forward_image(images)
-        text_encoder = model.backbone.language_backbone
-        _, text_tokens = text_encoder.encoder(token_ids)
-        text_tokens = text_tokens.transpose(0, 1)
-        text_memory = text_encoder.resizer(text_tokens)
-        text_attention_mask = token_ids.ne(0).ne(1)
-        backbone_out["language_features"] = text_memory
-        backbone_out["language_mask"] = text_attention_mask
+        # Run the actual model under bf16 autocast on CUDA. The ViT MLP uses
+        # sam3.perflib.fused.addmm_act which forces bf16 internally; without
+        # autocast around the forward, the bf16 output collides with fp32
+        # weights downstream. Sam3TrackingPredictor enters this same autocast
+        # in __init__, so eager production runs already happen in bf16.
+        autocast_ctx = (
+            torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+            if device.type == "cuda"
+            else torch.amp.autocast(device_type="cpu", enabled=False)
+        )
+        with autocast_ctx:
+            backbone_out = model.backbone.forward_image(images)
+            text_encoder = model.backbone.language_backbone
+            _, text_tokens = text_encoder.encoder(token_ids)
+            text_tokens = text_tokens.transpose(0, 1)
+            text_memory = text_encoder.resizer(text_tokens)
+            text_attention_mask = token_ids.ne(0).ne(1)
+            backbone_out["language_features"] = text_memory
+            backbone_out["language_mask"] = text_attention_mask
 
-        find_input = FindStage(
-            img_ids=img_ids,
-            text_ids=text_ids,
-            input_boxes=box_embeddings,
-            input_boxes_mask=box_mask,
-            input_boxes_label=box_labels,
-            input_points=torch.zeros(0, bs, 2, device=device),
-            input_points_mask=torch.zeros(bs, 0, device=device, dtype=torch.bool),
-        )
-        geometric_prompt = Prompt(
-            box_embeddings=box_embeddings,
-            box_mask=box_mask,
-            box_labels=box_labels,
-        )
-        out = model.forward_grounding(
-            backbone_out=backbone_out,
-            find_input=find_input,
-            find_target=None,
-            geometric_prompt=geometric_prompt,
-        )
+            find_input = FindStage(
+                img_ids=img_ids,
+                text_ids=text_ids,
+                input_boxes=box_embeddings,
+                input_boxes_mask=box_mask,
+                input_boxes_label=box_labels,
+                input_points=torch.zeros(0, bs, 2, device=device),
+                input_points_mask=torch.zeros(bs, 0, device=device, dtype=torch.bool),
+            )
+            geometric_prompt = Prompt(
+                box_embeddings=box_embeddings,
+                box_mask=box_mask,
+                box_labels=box_labels,
+            )
+            out = model.forward_grounding(
+                backbone_out=backbone_out,
+                find_input=find_input,
+                find_target=None,
+                geometric_prompt=geometric_prompt,
+            )
+        # Cast outputs back to fp32 so downstream consumers don't have to.
         return (
-            out["pred_logits"],
-            out["pred_boxes"],
-            out["pred_masks"],
-            out.get("presence_logit_dec"),
+            out["pred_logits"].float(),
+            out["pred_boxes"].float(),
+            out["pred_masks"].float(),
+            out["presence_logit_dec"].float() if out.get("presence_logit_dec") is not None else None,
         )
 
 
@@ -119,16 +131,7 @@ def export_full_pipeline(
     # take its min from the example shape (2) and refuse batch=1 at runtime.
     batch = Dim("batch", min=1)
     num_prompts = Dim("num_prompts", min=1)
-    # Trace under bf16 autocast on CUDA — the ViT MLP's addmm_act path emits
-    # bf16, and Sam3TrackingPredictor enters bf16 autocast in __init__, so
-    # eager production runs already happen under autocast. Without this, fc2
-    # downstream of addmm_act fails at runtime with bf16/fp32 mismatch.
-    autocast_ctx = (
-        torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-        if device.type == "cuda"
-        else torch.amp.autocast(device_type="cpu", enabled=False)
-    )
-    with torch.no_grad(), autocast_ctx:
+    with torch.no_grad():
         return torch.export.export(
             wrapper,
             (images, token_ids),
