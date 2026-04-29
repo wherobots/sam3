@@ -7,7 +7,7 @@ name = "sam3"
 dynamic = ["version"]
 description = "SAM3 (Segment Anything Model 3) implementation"
 readme = "README.md"
-requires-python = ">=3.9,<3.13"
+requires-python = ">=3.10,<3.13"
 license = {file = "LICENSE"}
 authors = [
     {name = "Meta AI Research"}
@@ -35,6 +35,8 @@ dependencies = [
     "huggingface_hub",
     "einops",
     "psutil",
+    "torch>=2.11,<2.12",
+    "torchvision>=0.26,<0.27",
 ]
 
 [project.optional-dependencies]
