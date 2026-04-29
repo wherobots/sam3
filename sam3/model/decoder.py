@@ -227,9 +227,18 @@ class TransformerDecoderLayer(nn.Module):
         # Works on both nn.MultiheadAttention and sam3's custom
         # MultiheadAttention (model_misc.MultiheadAttention) — both expose
         # in_proj_weight/bias, out_proj, num_heads, head_dim, dropout.
+        # Cast projection weights to the activation dtype so the call works
+        # under autocast (image encoder may emit bf16 while weights stay fp32);
+        # the upstream nn.MultiheadAttention forward does this internally.
         mha = self.cross_attn
+        in_proj_weight = mha.in_proj_weight.to(dtype=query.dtype)
+        in_proj_bias = (
+            mha.in_proj_bias.to(dtype=query.dtype)
+            if mha.in_proj_bias is not None
+            else None
+        )
         q, k, v = torchF._in_projection_packed(
-            query, key, value, mha.in_proj_weight, mha.in_proj_bias
+            query, key, value, in_proj_weight, in_proj_bias
         )
         tgt_len, bsz, _ = q.shape
         num_heads = mha.num_heads
@@ -238,7 +247,7 @@ class TransformerDecoderLayer(nn.Module):
         k = k.contiguous().view(-1, bsz, num_heads, head_dim).permute(1, 2, 0, 3)
         v = v.contiguous().view(-1, bsz, num_heads, head_dim).permute(1, 2, 0, 3)
         src_len = k.shape[2]
-        bias = attn_bias
+        bias = attn_bias.to(dtype=q.dtype)
         if bias.dim() == 3:
             bias = bias.view(bsz, num_heads, tgt_len, src_len)
         if key_padding_mask is not None:
@@ -254,7 +263,13 @@ class TransformerDecoderLayer(nn.Module):
             is_causal=False,
         )
         attn_output = attn_output.permute(2, 0, 1, 3).reshape(tgt_len, bsz, -1)
-        return torchF.linear(attn_output, mha.out_proj.weight, mha.out_proj.bias)
+        out_w = mha.out_proj.weight.to(dtype=attn_output.dtype)
+        out_b = (
+            mha.out_proj.bias.to(dtype=attn_output.dtype)
+            if mha.out_proj.bias is not None
+            else None
+        )
+        return torchF.linear(attn_output, out_w, out_b)
 
 
 class TransformerDecoder(nn.Module):
