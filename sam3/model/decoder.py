@@ -156,24 +156,46 @@ class TransformerDecoderLayer(nn.Module):
             tgt = tgt + self.catext_dropout(tgt2)
             tgt = self.catext_norm(tgt)
 
-        if presence_token is not None:
-            presence_token_mask = torch.zeros_like(cross_attn_mask[:, :1, :])
-            cross_attn_mask = torch.cat(
-                [presence_token_mask, cross_attn_mask], dim=1
-            )  # (bs*nheads, 1+nq, hw)
+        if presence_token is not None and cross_attn_mask is not None:
+            # Support both 3D (bs*nheads, nq, hw) and 4D (bs, nheads, nq, hw)
+            # cross_attn_mask shapes. The 4D form is used by the export-friendly
+            # SDPA path below; nn.MultiheadAttention requires the 3D form.
+            if cross_attn_mask.dim() == 4:
+                presence_token_mask = torch.zeros_like(cross_attn_mask[:, :, :1, :])
+                cross_attn_mask = torch.cat(
+                    [presence_token_mask, cross_attn_mask], dim=2
+                )  # (bs, nheads, 1+nq, hw)
+            else:
+                presence_token_mask = torch.zeros_like(cross_attn_mask[:, :1, :])
+                cross_attn_mask = torch.cat(
+                    [presence_token_mask, cross_attn_mask], dim=1
+                )  # (bs*nheads, 1+nq, hw)
 
         # Cross attention to image
-        tgt2 = self.cross_attn(
-            query=self.with_pos_embed(tgt, tgt_query_pos),
-            key=self.with_pos_embed(memory, memory_pos),
-            value=memory,
-            attn_mask=cross_attn_mask,
-            key_padding_mask=(
-                memory_key_padding_mask.transpose(0, 1)
-                if memory_key_padding_mask is not None
-                else None
-            ),
-        )[0]
+        key_padding_mask = (
+            memory_key_padding_mask.transpose(0, 1)
+            if memory_key_padding_mask is not None
+            else None
+        )
+        if cross_attn_mask is not None and cross_attn_mask.dim() == 4:
+            # nn.MultiheadAttention does not accept (bs, nheads, q, k) attention
+            # bias tensors. Box-RPB cross-attn passes a 4D additive bias, so
+            # route through a manual SDPA path that preserves the per-head bias.
+            tgt2 = self._cross_attn_with_rpb(
+                query=self.with_pos_embed(tgt, tgt_query_pos),
+                key=self.with_pos_embed(memory, memory_pos),
+                value=memory,
+                attn_bias=cross_attn_mask,
+                key_padding_mask=key_padding_mask,
+            )
+        else:
+            tgt2 = self.cross_attn(
+                query=self.with_pos_embed(tgt, tgt_query_pos),
+                key=self.with_pos_embed(memory, memory_pos),
+                value=memory,
+                attn_mask=cross_attn_mask,
+                key_padding_mask=key_padding_mask,
+            )[0]
 
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
@@ -187,6 +209,50 @@ class TransformerDecoderLayer(nn.Module):
             tgt = tgt[1:]
 
         return tgt, presence_token_out
+
+    def _cross_attn_with_rpb(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attn_bias: Tensor,
+        key_padding_mask: Optional[Tensor],
+    ) -> Tensor:
+        """
+        Manual SDPA cross-attention that preserves a per-head additive bias.
+        Used when ``attn_bias`` is 4D (bs, nheads, q, k) — the relative box
+        position bias path. ``nn.MultiheadAttention`` rejects 4D masks, so we
+        unpack the in/out projections and call ``scaled_dot_product_attention``.
+        """
+        mha = self.cross_attn
+        assert isinstance(mha, nn.MultiheadAttention)
+        q, k, v = torchF._in_projection_packed(
+            query, key, value, mha.in_proj_weight, mha.in_proj_bias
+        )
+        tgt_len, bsz, _ = q.shape
+        num_heads = mha.num_heads
+        head_dim = mha.head_dim
+        q = q.contiguous().view(tgt_len, bsz, num_heads, head_dim).permute(1, 2, 0, 3)
+        k = k.contiguous().view(-1, bsz, num_heads, head_dim).permute(1, 2, 0, 3)
+        v = v.contiguous().view(-1, bsz, num_heads, head_dim).permute(1, 2, 0, 3)
+        src_len = k.shape[2]
+        bias = attn_bias
+        if bias.dim() == 3:
+            bias = bias.view(bsz, num_heads, tgt_len, src_len)
+        if key_padding_mask is not None:
+            pad = key_padding_mask[:, None, None, :].to(dtype=q.dtype)
+            pad = pad.masked_fill(pad > 0, float("-inf"))
+            bias = bias + pad
+        attn_output = torchF.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=bias,
+            dropout_p=mha.dropout if self.training else 0.0,
+            is_causal=False,
+        )
+        attn_output = attn_output.permute(2, 0, 1, 3).reshape(tgt_len, bsz, -1)
+        return torchF.linear(attn_output, mha.out_proj.weight, mha.out_proj.bias)
 
 
 class TransformerDecoder(nn.Module):
@@ -338,11 +404,13 @@ class TransformerDecoder(nn.Module):
             self.compilable_cord_cache = self._get_coords(H, W, reference_boxes.device)
             self.compilable_stored_size = (H, W)
 
-        if torch.compiler.is_dynamo_compiling() or self.compilable_stored_size == (
-            H,
-            W,
-        ):
-            # good, hitting the cache, will be compilable
+        if torch.compiler.is_dynamo_compiling():
+            # When tracing, always reuse the compilable cache. The
+            # ``compilable_stored_size == (H, W)`` check would compare a tuple
+            # of SymInts against concrete ints and raise
+            # GuardOnDataDependentSymNode.
+            coords_h, coords_w = self.compilable_cord_cache
+        elif self.compilable_stored_size == (H, W):
             coords_h, coords_w = self.compilable_cord_cache
         else:
             # cache miss, will create compilation issue
@@ -352,9 +420,6 @@ class TransformerDecoder(nn.Module):
                     H, W, reference_boxes.device
                 )
             coords_h, coords_w = self.coord_cache[feat_size]
-
-            assert coords_h.shape == (H,)
-            assert coords_w.shape == (W,)
 
         deltas_y = coords_h.view(1, -1, 1) - boxes_xyxy.reshape(-1, 1, 4)[:, :, 1:4:2]
         deltas_y = deltas_y.view(bs, num_queries, -1, 2)
@@ -393,20 +458,12 @@ class TransformerDecoder(nn.Module):
             act_ckpt_enable=self.training and self.use_act_checkpoint,
         )  # bs, num_queries, H, n_heads
 
-        if not torch.compiler.is_dynamo_compiling():
-            assert deltas_x.shape[:3] == (bs, num_queries, W)
-            assert deltas_y.shape[:3] == (bs, num_queries, H)
-
         B = deltas_y.unsqueeze(3) + deltas_x.unsqueeze(
             2
         )  # bs, num_queries, H, W, n_heads
-        if not torch.compiler.is_dynamo_compiling():
-            assert B.shape[:4] == (bs, num_queries, H, W)
         B = B.flatten(2, 3)  # bs, num_queries, H*W, n_heads
         B = B.permute(0, 3, 1, 2)  # bs, n_heads, num_queries, H*W
         B = B.contiguous()  # memeff attn likes ordered strides
-        if not torch.compiler.is_dynamo_compiling():
-            assert B.shape[2:] == (num_queries, H * W)
         return B
 
     def forward(
@@ -519,11 +576,12 @@ class TransformerDecoder(nn.Module):
                 assert spatial_shapes.shape[0] == 1, (
                     "only single scale support implemented"
                 )
+                # Keep the 4D (bs, nheads, nq, H*W) shape so the export-friendly
+                # SDPA path in TransformerDecoderLayer can apply the bias per-head.
                 memory_mask = self._get_rpb_matrix(
                     reference_boxes,
                     (spatial_shapes[0, 0], spatial_shapes[0, 1]),
                 )
-                memory_mask = memory_mask.flatten(0, 1)  # (bs*n_heads, nq, H*W)
             if self.training:
                 assert self.use_act_checkpoint, (
                     "Activation checkpointing not enabled in the decoder"

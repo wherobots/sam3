@@ -133,3 +133,4 @@ testpaths = ["tests"]
 python_files = "test_*.py"
 python_classes = "Test*"
 python_functions = "test_*"
+markers = ["slow: builds the full SAM3 model (heavy GPU + slow)"]

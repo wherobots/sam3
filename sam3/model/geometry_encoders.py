@@ -645,11 +645,26 @@ class SequenceGeometryEncoder(nn.Module):
             # We need to denormalize, and convert to [x, y, x, y]
             boxes_xyxy = box_cxcywh_to_xyxy(boxes)
             scale = torch.tensor([W, H, W, H], dtype=boxes_xyxy.dtype)
-            scale = scale.pin_memory().to(device=boxes_xyxy.device, non_blocking=True)
+            # pin_memory + non_blocking copy is unsupported under torch.export tracing.
+            if not torch._dynamo.is_compiling() and boxes_xyxy.device.type != "cpu":
+                scale = scale.pin_memory().to(
+                    device=boxes_xyxy.device, non_blocking=True
+                )
+            else:
+                scale = scale.to(device=boxes_xyxy.device)
             scale = scale.view(1, 1, 4)
             boxes_xyxy = boxes_xyxy * scale
+            # ROIAlign accepts a list of per-batch box tensors OR a single
+            # [N, 5] tensor with batch_idx prepended. The list form is hard to
+            # trace through torch.export, so use the batched format.
+            boxes_xyxy = boxes_xyxy.transpose(0, 1)  # (bs, n_boxes, 4)
+            batch_idx = torch.arange(
+                bs, device=boxes_xyxy.device, dtype=boxes_xyxy.dtype
+            )
+            batch_idx = batch_idx.view(bs, 1, 1).expand(bs, n_boxes, 1)
+            boxes_for_roi = torch.cat([batch_idx, boxes_xyxy], dim=-1).reshape(-1, 5)
             sampled = torchvision.ops.roi_align(
-                img_feats, boxes_xyxy.float().transpose(0, 1).unbind(0), self.roi_size
+                img_feats, boxes_for_roi.float(), self.roi_size
             )
             assert list(sampled.shape) == [
                 bs * n_boxes,

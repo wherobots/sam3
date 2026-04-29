@@ -58,8 +58,11 @@ class PositionEmbeddingSine(nn.Module):
                 self.cache[size] = self.cache[size].clone().detach()
 
     def _encode_xy(self, x, y):
-        # The positions are expected to be normalized
-        assert len(x) == len(y) and x.ndim == y.ndim == 1
+        # The positions are expected to be normalized.
+        # Skip the size assert when tracing — symbolic shapes from dynamic
+        # prompts make `len(x) == len(y)` raise GuardOnDataDependentSymNode.
+        if not torch._dynamo.is_compiling():
+            assert len(x) == len(y) and x.ndim == y.ndim == 1
         x_embed = x * self.scale
         y_embed = y * self.scale
 
@@ -95,9 +98,11 @@ class PositionEmbeddingSine(nn.Module):
 
     @torch.no_grad()
     def forward(self, x):
-        cache_key = None
         cache_key = (x.shape[-2], x.shape[-1])
-        if cache_key in self.cache:
+        # Skip the cache when tracing with symbolic shapes — looking up a SymInt
+        # key in a dict with concrete-int keys raises GuardOnDataDependentSymNode.
+        use_cache = all(isinstance(dim, int) for dim in cache_key)
+        if use_cache and cache_key in self.cache:
             return self.cache[cache_key][None].repeat(x.shape[0], 1, 1, 1)
         y_embed = (
             torch.arange(1, x.shape[-2] + 1, dtype=torch.float32, device=x.device)
@@ -127,6 +132,6 @@ class PositionEmbeddingSine(nn.Module):
             (pos_y[:, :, :, 0::2].sin(), pos_y[:, :, :, 1::2].cos()), dim=4
         ).flatten(3)
         pos = torch.cat((pos_y, pos_x), dim=3).permute(0, 3, 1, 2)
-        if cache_key is not None:
+        if use_cache:
             self.cache[cache_key] = pos[0]
         return pos
