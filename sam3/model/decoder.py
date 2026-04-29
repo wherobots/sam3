@@ -404,11 +404,11 @@ class TransformerDecoder(nn.Module):
             self.compilable_cord_cache = self._get_coords(H, W, reference_boxes.device)
             self.compilable_stored_size = (H, W)
 
-        if torch.compiler.is_dynamo_compiling():
-            # When tracing, always reuse the compilable cache. The
-            # ``compilable_stored_size == (H, W)`` check would compare a tuple
-            # of SymInts against concrete ints and raise
-            # GuardOnDataDependentSymNode.
+        if torch.compiler.is_compiling():
+            # When tracing (torch.compile or torch.export, strict or non-strict),
+            # always reuse the compilable cache. The ``compilable_stored_size ==
+            # (H, W)`` check would compare a tuple of concrete ints against a
+            # tuple of SymInts and raise GuardOnDataDependentSymNode.
             coords_h, coords_w = self.compilable_cord_cache
         elif self.compilable_stored_size == (H, W):
             coords_h, coords_w = self.compilable_cord_cache

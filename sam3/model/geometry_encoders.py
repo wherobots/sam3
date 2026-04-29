@@ -646,7 +646,7 @@ class SequenceGeometryEncoder(nn.Module):
             boxes_xyxy = box_cxcywh_to_xyxy(boxes)
             scale = torch.tensor([W, H, W, H], dtype=boxes_xyxy.dtype)
             # pin_memory + non_blocking copy is unsupported under torch.export tracing.
-            if not torch._dynamo.is_compiling() and boxes_xyxy.device.type != "cpu":
+            if not torch.compiler.is_compiling() and boxes_xyxy.device.type != "cpu":
                 scale = scale.pin_memory().to(
                     device=boxes_xyxy.device, non_blocking=True
                 )

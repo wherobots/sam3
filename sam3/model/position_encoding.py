@@ -61,7 +61,7 @@ class PositionEmbeddingSine(nn.Module):
         # The positions are expected to be normalized.
         # Skip the size assert when tracing — symbolic shapes from dynamic
         # prompts make `len(x) == len(y)` raise GuardOnDataDependentSymNode.
-        if not torch._dynamo.is_compiling():
+        if not torch.compiler.is_compiling():
             assert len(x) == len(y) and x.ndim == y.ndim == 1
         x_embed = x * self.scale
         y_embed = y * self.scale
