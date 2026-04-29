@@ -224,8 +224,10 @@ class TransformerDecoderLayer(nn.Module):
         position bias path. ``nn.MultiheadAttention`` rejects 4D masks, so we
         unpack the in/out projections and call ``scaled_dot_product_attention``.
         """
+        # Works on both nn.MultiheadAttention and sam3's custom
+        # MultiheadAttention (model_misc.MultiheadAttention) — both expose
+        # in_proj_weight/bias, out_proj, num_heads, head_dim, dropout.
         mha = self.cross_attn
-        assert isinstance(mha, nn.MultiheadAttention)
         q, k, v = torchF._in_projection_packed(
             query, key, value, mha.in_proj_weight, mha.in_proj_bias
         )
