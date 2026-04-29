@@ -119,7 +119,16 @@ def export_full_pipeline(
     # take its min from the example shape (2) and refuse batch=1 at runtime.
     batch = Dim("batch", min=1)
     num_prompts = Dim("num_prompts", min=1)
-    with torch.no_grad():
+    # Trace under bf16 autocast on CUDA — the ViT MLP's addmm_act path emits
+    # bf16, and Sam3TrackingPredictor enters bf16 autocast in __init__, so
+    # eager production runs already happen under autocast. Without this, fc2
+    # downstream of addmm_act fails at runtime with bf16/fp32 mismatch.
+    autocast_ctx = (
+        torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+        if device.type == "cuda"
+        else torch.amp.autocast(device_type="cpu", enabled=False)
+    )
+    with torch.no_grad(), autocast_ctx:
         return torch.export.export(
             wrapper,
             (images, token_ids),
