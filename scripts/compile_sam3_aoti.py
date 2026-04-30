@@ -11,7 +11,17 @@ Usage::
         --in artifacts/export/full_sam3_pipeline.pt2 \
         --out artifacts/aoti/full_sam3_pipeline_aoti.pt2
 
-Notes:
+Environment requirements (CUDA build):
+- ``CUDA_HOME`` must point at a CUDA toolkit with ``nvcc``. If the system
+  doesn't have one installed, the simplest path is::
+
+      uv pip install --index-url https://pypi.nvidia.com \\
+          nvidia-cuda-nvcc nvidia-cuda-cccl
+      export CUDA_HOME=$VIRTUAL_ENV/lib/python3.12/site-packages/nvidia/cu13
+      export PATH=$CUDA_HOME/bin:$PATH
+
+  The torch wheels (``torch==2.10.0+cu128``) do not bundle ``nvcc`` —
+  only the runtime libraries.
 - ``import torchvision.ops`` runs before ``torch.export.load`` so that
   ``torch.ops.torchvision.roi_align.default`` is registered before the
   serialized graph references it.
@@ -23,6 +33,8 @@ import argparse
 from pathlib import Path
 
 import torch
+import torch._inductor
+import torch._inductor.codecache  # noqa: F401  -- workaround for torch 2.10 aoti_load_package
 import torchvision.ops  # noqa: F401  -- registers roi_align before load
 
 
